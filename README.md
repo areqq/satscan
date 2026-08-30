@@ -62,8 +62,15 @@ and reads DVB SI tables from the demux with three parallel section filters:
 SDT actual+other in one mask (0x42/0xFB), NIT actual, and BAT filtered by
 bouquet id. The BAT filter is additionally verified in software — some demux
 drivers (seen on some boxes) ignore the extension part of the hardware filter.
-LCN and delivery descriptors follow the same layout the SatScanLcn Enigma2
-plugin parses; satscan is an independent from-scratch implementation.
+
+## Credits / inspiration
+
+satscan was inspired by **[SatScanLcn](https://github.com/Huevos/SatScanLcn)**
+by Huevos — an Enigma2 plugin covering 30+ European platforms. Its provider
+database and descriptor parsing were the reference for the home-transponder
+parameters and the LCN descriptor layouts (0x82 NIT / 0x83 BAT) used here.
+satscan is an independent from-scratch implementation (Zig, raw syscalls,
+no Enigma2 dependency), not a port of its code.
 
 ## Building
 

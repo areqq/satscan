@@ -62,8 +62,16 @@ i czyta tablice DVB SI z demuxa trzema równoległymi filtrami sekcji:
 SDT actual+other jedną maską (0x42/0xFB), NIT actual oraz BAT filtrowany po
 bouquet id. Filtr BAT jest dodatkowo weryfikowany programowo — niektóre
 sterowniki demuxa (widziane na czesci dekoderow) ignorują część extension filtra
-sprzętowego. Układ deskryptorów LCN i delivery jest ten sam, który parsuje
-wtyczka SatScanLcn dla Enigma2; satscan to niezależna implementacja od zera.
+sprzętowego.
+
+## Podziękowania / inspiracja
+
+Inspiracją dla satscan był **[SatScanLcn](https://github.com/Huevos/SatScanLcn)**
+autorstwa Huevosa — wtyczka Enigma2 obsługująca ponad 30 europejskich platform.
+Jego baza providerów i parsowanie deskryptorów posłużyły za punkt odniesienia
+dla parametrów transponderów domowych i układów deskryptorów LCN (0x82 NIT /
+0x83 BAT). satscan to niezależna implementacja od zera (Zig, surowe syscalle,
+bez zależności od Enigma2), nie port tamtego kodu.
 
 ## Budowanie
 
