@@ -22,14 +22,8 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 
-// ---------- ioctl ----------
-fn ioc(dir: u32, typ: u32, nr: u32, size: u32) u32 {
-    return (dir << 30) | (size << 16) | (typ << 8) | nr;
-}
-const IOC_NONE: u32 = 0;
-const IOC_WRITE: u32 = 1;
-const IOC_READ: u32 = 2;
-const O: u32 = 'o';
+// ---------- ioctl (arch-aware: mips/ppc maja inne kodowanie dir/size) ----------
+const IOCTL = linux.IOCTL;
 
 // ---------- DVB frontend (API v5) ----------
 const FE_HAS_LOCK: u32 = 0x10;
@@ -82,11 +76,11 @@ const dtv_properties = extern struct {
 };
 
 const dvb_diseqc_master_cmd = extern struct { msg: [6]u8, msg_len: u8 };
-const FE_DISEQC_SEND_MASTER_CMD = ioc(IOC_WRITE, O, 63, @sizeOf(dvb_diseqc_master_cmd));
-const FE_SET_PROPERTY = ioc(IOC_WRITE, O, 82, @sizeOf(dtv_properties));
-const FE_READ_STATUS = ioc(IOC_READ, O, 69, 4);
-const FE_SET_VOLTAGE = ioc(IOC_NONE, O, 67, 0);
-const FE_SET_TONE = ioc(IOC_NONE, O, 66, 0);
+const FE_DISEQC_SEND_MASTER_CMD = IOCTL.IOW('o', 63, dvb_diseqc_master_cmd);
+const FE_SET_PROPERTY = IOCTL.IOW('o', 82, dtv_properties);
+const FE_READ_STATUS = IOCTL.IOR('o', 69, u32);
+const FE_SET_VOLTAGE = IOCTL.IO('o', 67);
+const FE_SET_TONE = IOCTL.IO('o', 66);
 
 // ---------- DVB demux ----------
 const dmx_filter = extern struct {
@@ -102,8 +96,8 @@ const dmx_sct_filter_params = extern struct {
 };
 const DMX_CHECK_CRC: u32 = 1;
 const DMX_IMMEDIATE_START: u32 = 4;
-const DMX_SET_FILTER = ioc(IOC_WRITE, O, 43, @sizeOf(dmx_sct_filter_params));
-const DMX_STOP = ioc(IOC_NONE, O, 42, 0);
+const DMX_SET_FILTER = IOCTL.IOW('o', 43, dmx_sct_filter_params);
+const DMX_STOP = IOCTL.IO('o', 42);
 
 // ---------- provider table ----------
 const Provider = struct {
