@@ -1,15 +1,22 @@
 // satscan — niezalezna binarka (Zig 0.16) do skanowania list Polsat/Canal+ z 13E.
-// Stroi frontend DVB-S2 (antena 1x1, BEZ DiSEqC — samo napiecie + ton 22kHz),
-// czeka na LOCK, czyta z demuxa sekcje SI (SDT/NIT/BAT) i wypisuje surowy tekst
-// (po jednej linii na wpis), ktory dalej obrabiamy naszymi skryptami.
 //
-// Uzycie: satscan [--adapter N] [--frontend N] [--demux N] --provider canalplus|polsat
-//                 [--lnb-lo kHz] [--lnb-hi kHz] [--lnb-sw kHz] [--secs S]
+// Automatyka: czyta /etc/enigma2/settings i sam dobiera tuner — pomija NIM-y
+// nieskonfigurowane na 13.0E, rozpoznaje unicable (EN50494: scrList/scrfrequency)
+// i zwykly LNB (napiecie+ton, bez DiSEqC), probuje kolejne frontendy az do LOCK
+// (zajety EBUSY lub brak sygnalu -> nastepny). Czyta sekcje SI z demuxa:
+// SDT actual+other (nazwy uslug), NIT (transpondery + LCN Polsatu 0x82),
+// BAT (LCN Canal+ 0x83, filtr bouquet_id). Wynik: surowy tekst na stdout.
+//
+// Uzycie: satscan --provider canalplus|polsat
+//   [--adapter N] [--frontend N] [--demux N] [--settings /etc/enigma2/settings]
+//   [--scr-slot N --scr-freq MHz]  (wymusza unicable zamiast configu z settings)
+//   [--lnb-lo kHz] [--lnb-hi kHz] [--lnb-sw kHz] [--secs S] [--scan-secs S]
 //
 // Format wyjscia (stdout):
-//   # provider=<p> freq=<kHz> pol=<H|V> lock=<0|1>
-//   S <sid_hex>:<tsid_hex>:<onid_hex> type=<n> "<name>" "<provider>"
-//   (kolejne tablice — NIT/BAT z LCN — dochodza w nastepnej iteracji)
+//   # provider=<p> freq=<kHz> pol=<H|V> lock=1 frontend=<n>
+//   T <tsid>:<onid> freq=<kHz> pol=<..> sr=<sym/s> fec=<n> sys=<S|S2> pos=<...> mod=<n>
+//   S <sid>:<tsid>:<onid> type=<n> "<nazwa>" "<provider>"
+//   L <lcn> <sid>:<tsid>:<onid> visible=<0|1> src=<nit|bat>
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -388,6 +395,96 @@ fn parseNitLike(section: []const u8, table_id_want: u8, lcn_desc: u8, lcn_src: [
     }
 }
 
+// ---------- konfiguracja tunerow z /etc/enigma2/settings ----------
+const NimMode = enum { unknown, simple, advanced, nothing, equal, loopthrough, satposdepends };
+const NimCfg = struct {
+    seen: bool = false,
+    mode: NimMode = .unknown,
+    diseqc130: bool = false, // simple: diseqcA=130
+    adv130: bool = false, // advanced: sat.130 skonfigurowany
+    unicable: bool = false,
+    scr_slot: u8 = 0,
+    scr_freq: u32 = 0,
+
+    fn eligible13e(self: NimCfg) bool {
+        return switch (self.mode) {
+            .nothing => false,
+            .advanced => self.adv130,
+            else => self.diseqc130 or self.adv130,
+        };
+    }
+};
+
+fn valueAfterEq(kv: []const u8) []const u8 {
+    const eq = std.mem.lastIndexOfScalar(u8, kv, '=') orelse return "";
+    return kv[eq + 1 ..];
+}
+
+fn parseSettings(path: [*:0]const u8, nims: []NimCfg) bool {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const buf = std.heap.page_allocator.alloc(u8, 1024 * 1024) catch return false;
+    defer std.heap.page_allocator.free(buf);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = linux.read(fd, buf.ptr + total, buf.len - total);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        total += n;
+    }
+    var lines = std.mem.splitScalar(u8, buf[0..total], '\n');
+    const prefix = "config.Nims.";
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const rest = line[prefix.len..];
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse continue;
+        const idx = std.fmt.parseInt(u8, rest[0..dot], 10) catch continue;
+        if (idx >= nims.len) continue;
+        const c = &nims[idx];
+        c.seen = true;
+        const kv = rest[dot + 1 ..];
+        if (std.mem.startsWith(u8, kv, "configMode=")) {
+            const v = valueAfterEq(kv);
+            c.mode = if (std.mem.eql(u8, v, "simple")) .simple
+            else if (std.mem.eql(u8, v, "advanced")) .advanced
+            else if (std.mem.eql(u8, v, "nothing")) .nothing
+            else if (std.mem.eql(u8, v, "equal")) .equal
+            else if (std.mem.eql(u8, v, "loopthrough")) .loopthrough
+            else if (std.mem.eql(u8, v, "satposdepends")) .satposdepends
+            else .unknown;
+        } else if (std.mem.eql(u8, kv, "diseqcA=130")) {
+            c.diseqc130 = true;
+        } else if (std.mem.startsWith(u8, kv, "advanced.sat.130.")) {
+            c.adv130 = true;
+        } else if (std.mem.indexOf(u8, kv, ".lof=unicable") != null) {
+            c.unicable = true;
+        } else if (std.mem.indexOf(u8, kv, ".scrfrequency=") != null) {
+            c.scr_freq = std.fmt.parseInt(u32, valueAfterEq(kv), 10) catch 0;
+        } else if (std.mem.indexOf(u8, kv, ".scrList=") != null) {
+            const n = std.fmt.parseInt(u8, valueAfterEq(kv), 10) catch 0;
+            c.scr_slot = if (n > 0) n - 1 else 0; // numer UB (1-based) -> indeks EN50494
+        }
+    }
+    return true;
+}
+
+// equal/loopthrough/satposdepends dziedzicza konfiguracje po pierwszym pelnym NIM-ie
+fn effectiveNim(nims: []const NimCfg, idx: usize) ?NimCfg {
+    if (idx >= nims.len) return null;
+    const c = nims[idx];
+    switch (c.mode) {
+        .nothing => return null,
+        .equal, .loopthrough, .satposdepends => {
+            for (nims) |donor| {
+                if (donor.eligible13e() and donor.mode != .equal and donor.mode != .loopthrough and donor.mode != .satposdepends) return donor;
+            }
+            return null;
+        },
+        else => return if (c.eligible13e()) c else null,
+    }
+}
+
 fn findProvider(key: []const u8) ?Provider {
     for (PROVIDERS) |p| {
         if (std.mem.eql(u8, p.key, key)) return p;
@@ -407,6 +504,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var scan_secs: u32 = 25;
     var scr_slot: ?u8 = null;
     var scr_freq: u32 = 0;
+    var settings_path: [:0]const u8 = "/etc/enigma2/settings";
 
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.skip(); // argv0
@@ -433,6 +531,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             scr_slot = try std.fmt.parseInt(u8, it.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--scr-freq")) {
             scr_freq = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--settings")) {
+            settings_path = it.next() orelse return error.MissingArg;
         }
     }
 
@@ -441,37 +541,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return error.BadProvider;
     };
 
-    // Otwarcie tunera: podany --frontend, albo auto — pierwszy, ktory sie otworzy
-    // (zajety przez enigme zwraca EBUSY i jest pomijany).
-    var pathbuf: [64]u8 = undefined;
-    var fe: i32 = -1;
-    var chosen_fe: u32 = 0;
-    if (fe_index) |fi| {
-        const fe_path = try std.fmt.bufPrintZ(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ adapter, fi });
-        fe = sysOpen(fe_path, true) orelse {
-            std.debug.print("[satscan] frontend{d} zajety/niedostepny\n", .{fi});
-            return error.TunerBusy;
-        };
-        chosen_fe = fi;
-    } else {
-        var f: u32 = 0;
-        while (f < 8) : (f += 1) {
-            const fe_path = try std.fmt.bufPrintZ(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ adapter, f });
-            if (sysOpen(fe_path, true)) |fd| {
-                fe = fd;
-                chosen_fe = f;
-                break;
-            }
-        }
-        if (fe < 0) {
-            std.debug.print("[satscan] brak wolnego tunera (zajete przez enigme?) — zwolnij tuner albo zatrzymaj enigme2\n", .{});
-            return error.NoFreeTuner;
-        }
-    }
-    defer _ = linux.close(fe);
-    std.debug.print("[satscan] tuner: frontend{d}\n", .{chosen_fe});
+    // Konfiguracja tunerow z ustawien enigmy (unicable, przypisanie 13E).
+    var nims = [_]NimCfg{.{}} ** 16;
+    const have_settings = parseSettings(settings_path, &nims);
+    if (!have_settings) std.debug.print("[satscan] brak {s} - probuje wszystkie tunery ze zwyklym LNB\n", .{settings_path});
 
-    const scr: ?Scr = if (scr_slot) |sl| blk: {
+    const cli_scr: ?Scr = if (scr_slot) |sl| blk: {
         if (scr_freq == 0) {
             std.debug.print("[satscan] --scr-slot wymaga --scr-freq <MHz>\n", .{});
             return error.MissingArg;
@@ -479,19 +554,67 @@ pub fn main(init: std.process.Init.Minimal) !void {
         break :blk Scr{ .slot = sl, .freq_mhz = scr_freq };
     } else null;
 
-    try tune(fe, p, lnb, scr);
-    var locked = waitLock(fe, secs);
-    if (!locked and scr != null) { // unicable bywa kaprysny — druga proba
-        try tune(fe, p, lnb, scr);
-        locked = waitLock(fe, secs);
+    // Auto-wybor: kolejne frontendy; konfiguracja NIM-a z settings; zajety (EBUSY)
+    // lub bez LOCK -> nastepny. --frontend przypina konkretny.
+    var pathbuf: [64]u8 = undefined;
+    var fe: i32 = -1;
+    var chosen_fe: u32 = 0;
+    var locked = false;
+    var f: u32 = if (fe_index) |fi| fi else 0;
+    const f_end: u32 = if (fe_index) |fi| fi + 1 else 16;
+    while (f < f_end) : (f += 1) {
+        var scr: ?Scr = cli_scr;
+        if (have_settings) {
+            if (effectiveNim(&nims, f)) |cfg| {
+                if (cli_scr == null and cfg.unicable and cfg.scr_freq != 0) {
+                    scr = Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
+                }
+            } else if (fe_index == null) {
+                continue; // NIM nieskonfigurowany na 13E - pomijamy w trybie auto
+            } else {
+                std.debug.print("[satscan] frontend{d}: NIM nieskonfigurowany na 13E - probuje mimo to\n", .{f});
+            }
+        }
+        const fe_path = try std.fmt.bufPrintZ(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ adapter, f });
+        const fd = sysOpen(fe_path, true) orelse {
+            if (fe_index != null) {
+                std.debug.print("[satscan] frontend{d} zajety/niedostepny\n", .{f});
+                return error.TunerBusy;
+            }
+            continue;
+        };
+        if (scr) |u| {
+            std.debug.print("[satscan] frontend{d}: unicable slot={d} freq={d}MHz\n", .{ f, u.slot, u.freq_mhz });
+        } else {
+            std.debug.print("[satscan] frontend{d}: zwykly LNB\n", .{f});
+        }
+        tune(fd, p, lnb, scr) catch {
+            _ = linux.close(fd);
+            continue;
+        };
+        var ok = waitLock(fd, secs);
+        if (!ok and scr != null) { // unicable bywa kaprysny - druga proba
+            tune(fd, p, lnb, scr) catch {};
+            ok = waitLock(fd, secs);
+        }
+        if (ok) {
+            fe = fd;
+            chosen_fe = f;
+            locked = true;
+            break;
+        }
+        std.debug.print("[satscan] frontend{d}: brak LOCK\n", .{f});
+        _ = linux.close(fd);
     }
-
-    var out = Out{};
-    out.line("# provider={s} freq={d} pol={s} lock={d}\n", .{ p.name, p.freq, if (p.pol_h) "H" else "V", @intFromBool(locked) });
-    if (!locked) {
-        std.debug.print("[satscan] brak LOCK — sprawdz LNB/kabel/pozycje anteny\n", .{});
+    if (fe < 0) {
+        std.debug.print("[satscan] zaden tuner nie zlapal LOCK na 13E\n", .{});
         return error.NoLock;
     }
+    defer _ = linux.close(fe);
+    std.debug.print("[satscan] tuner: frontend{d}\n", .{chosen_fe});
+
+    var out = Out{};
+    out.line("# provider={s} freq={d} pol={s} lock={d} frontend={d}\n", .{ p.name, p.freq, if (p.pol_h) "H" else "V", @intFromBool(locked), chosen_fe });
 
     var dmxbuf: [64]u8 = undefined;
     const dmx_path = try std.fmt.bufPrintZ(&dmxbuf, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, demux });
