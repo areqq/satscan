@@ -74,6 +74,8 @@ const dtv_properties = extern struct {
     props: [*]dtv_property,
 };
 
+const dvb_diseqc_master_cmd = extern struct { msg: [6]u8, msg_len: u8 };
+const FE_DISEQC_SEND_MASTER_CMD = ioc(IOC_WRITE, O, 63, @sizeOf(dvb_diseqc_master_cmd));
 const FE_SET_PROPERTY = ioc(IOC_WRITE, O, 82, @sizeOf(dtv_properties));
 const FE_READ_STATUS = ioc(IOC_READ, O, 69, 4);
 const FE_SET_VOLTAGE = ioc(IOC_NONE, O, 67, 0);
@@ -108,11 +110,14 @@ const Provider = struct {
     mod: u32,
     onid: u16,
     tsid: u16,
+    bat_bouquet_id: u16 = 0, // 0 = bez BAT
+    bat_lcn_desc: u8 = 0, // deskryptor LCN w BAT (Canal+: 0x83)
+    nit_lcn_desc: u8 = 0, // deskryptor LCN w NIT (Polsat: 0x82)
 };
 
 const PROVIDERS = [_]Provider{
-    .{ .key = "canalplus", .name = "Platforma Canal+", .freq = 10719000, .sr = 27500000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 318, .tsid = 11000 },
-    .{ .key = "polsat", .name = "Polsat Box", .freq = 12188000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 113, .tsid = 7400 },
+    .{ .key = "canalplus", .name = "Platforma Canal+", .freq = 10719000, .sr = 27500000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 318, .tsid = 11000, .bat_bouquet_id = 0x2020, .bat_lcn_desc = 0x83 },
+    .{ .key = "polsat", .name = "Polsat Box", .freq = 12188000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 113, .tsid = 7400, .nit_lcn_desc = 0x82 },
 };
 
 // ---------- I/O na surowych syscallach (bez libc) ----------
@@ -143,16 +148,38 @@ fn ioctlChecked(fd: i32, request: u32, arg: usize, what: []const u8) !void {
 }
 
 const Lnb = struct { lo: u32 = 9750000, hi: u32 = 10600000, sw: u32 = 11700000 };
+const Scr = struct { slot: u8, freq_mhz: u32 }; // Unicable EN50494 (user band)
 
-fn tune(fd: i32, p: Provider, lnb: Lnb) !void {
-    // ton/napiecie wg pasma i polaryzacji (uniwersalny LNB, bez DiSEqC)
+fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr) !void {
     const high = p.freq >= lnb.sw;
-    const ifreq: u32 = if (high) p.freq - lnb.hi else p.freq - lnb.lo;
-    const voltage: u32 = if (p.pol_h) SEC_VOLTAGE_18 else SEC_VOLTAGE_13;
-    const tone: u32 = if (high) SEC_TONE_ON else SEC_TONE_OFF;
+    var ifreq: u32 = if (high) p.freq - lnb.hi else p.freq - lnb.lo;
 
-    try ioctlChecked(fd, FE_SET_VOLTAGE, voltage, "FE_SET_VOLTAGE");
-    try ioctlChecked(fd, FE_SET_TONE, tone, "FE_SET_TONE");
+    if (scr) |u| {
+        // Unicable EN50494: komenda SCR na 18V, odbior na czestotliwosci slotu
+        const tp_if_mhz = ifreq / 1000;
+        const t: u32 = (tp_if_mhz + u.freq_mhz + 2) / 4 - 350;
+        var cmd = dvb_diseqc_master_cmd{ .msg = .{
+            0xE0, 0x10, 0x5A,
+            (@as(u8, u.slot & 0x07) << 5) | (@as(u8, @intFromBool(p.pol_h)) << 3) | (@as(u8, @intFromBool(high)) << 2) | @as(u8, @intCast((t >> 8) & 0x03)),
+            @intCast(t & 0xff),
+            0,
+        }, .msg_len = 5 };
+        try ioctlChecked(fd, FE_SET_TONE, SEC_TONE_OFF, "FE_SET_TONE");
+        try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_13, "FE_SET_VOLTAGE");
+        sleepMs(15);
+        try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_18, "FE_SET_VOLTAGE(18)");
+        sleepMs(10);
+        try ioctlChecked(fd, FE_DISEQC_SEND_MASTER_CMD, @intFromPtr(&cmd), "FE_DISEQC_SEND_MASTER_CMD");
+        sleepMs(10);
+        try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_13, "FE_SET_VOLTAGE(13)");
+        ifreq = u.freq_mhz * 1000; // odbior na IF slotu
+    } else {
+        // ton/napiecie wg pasma i polaryzacji (uniwersalny LNB, bez DiSEqC)
+        const voltage: u32 = if (p.pol_h) SEC_VOLTAGE_18 else SEC_VOLTAGE_13;
+        const tone: u32 = if (high) SEC_TONE_ON else SEC_TONE_OFF;
+        try ioctlChecked(fd, FE_SET_VOLTAGE, voltage, "FE_SET_VOLTAGE");
+        try ioctlChecked(fd, FE_SET_TONE, tone, "FE_SET_TONE");
+    }
 
     var props = [_]dtv_property{
         .{ .cmd = DTV_CLEAR },
@@ -182,7 +209,7 @@ fn waitLock(fd: i32, secs: u32) bool {
     return false;
 }
 
-fn setSectionFilter(fd: i32, pid: u16, table_id: u8) !void {
+fn setSectionFilter(fd: i32, pid: u16, table_id: u8, table_mask: u8, ext_id: ?u16) !void {
     var params = dmx_sct_filter_params{
         .pid = pid,
         .filter = .{},
@@ -190,7 +217,13 @@ fn setSectionFilter(fd: i32, pid: u16, table_id: u8) !void {
         .flags = DMX_CHECK_CRC | DMX_IMMEDIATE_START,
     };
     params.filter.filter[0] = table_id;
-    params.filter.mask[0] = 0xff;
+    params.filter.mask[0] = table_mask;
+    if (ext_id) |e| { // filter[1..2] mapuja sie na bajty 3-4 sekcji (table_id_extension)
+        params.filter.filter[1] = @intCast(e >> 8);
+        params.filter.filter[2] = @intCast(e & 0xff);
+        params.filter.mask[1] = 0xff;
+        params.filter.mask[2] = 0xff;
+    }
     try ioctlChecked(fd, DMX_SET_FILTER, @intFromPtr(&params), "DMX_SET_FILTER");
 }
 
@@ -209,6 +242,7 @@ const Out = struct {
 
 fn parseSdt(section: []const u8, onid_out: *u16, out: *Out, seen: *std.AutoHashMap(u32, void)) void {
     if (section.len < 12) return;
+    if (section[0] != 0x42 and section[0] != 0x46) return;
     const tsid = u16be(section, 3);
     const onid = u16be(section, 8);
     onid_out.* = onid;
@@ -270,6 +304,90 @@ fn copyName(dst: []u8, src: []const u8) usize {
     return n;
 }
 
+const POLCHARS = "HVLR";
+const Seen = std.AutoHashMap(u64, void);
+
+fn emitLcn(out: *Out, seen: *Seen, src: []const u8, lcn: u16, sid: u16, tsid: u16, onid: u16, visible: u8) void {
+    const key: u64 = (@as(u64, sid) << 48) | (@as(u64, tsid) << 32) | (@as(u64, onid) << 16) | lcn;
+    if (seen.get(key) != null) return;
+    seen.put(key, {}) catch {};
+    out.line("L {d} {X:0>4}:{X:0>4}:{X:0>4} visible={d} src={s}\n", .{ lcn, sid, tsid, onid, visible, src });
+}
+
+fn bcd(b: []const u8) u32 {
+    var v: u32 = 0;
+    for (b) |c| {
+        v = v * 100 + (c >> 4) * 10 + (c & 0x0f);
+    }
+    return v;
+}
+
+// NIT (0x40) i BAT (0x4A) maja te sama strukture petli TS; roznia sie znaczeniem
+// pol naglowka i miejscem LCN. lcn_desc — ktory deskryptor traktowac jako LCN.
+fn parseNitLike(section: []const u8, table_id_want: u8, lcn_desc: u8, lcn_src: []const u8,
+                out: *Out, seen_tp: *Seen, seen_lcn: *Seen) void {
+    if (section.len < 12) return;
+    if (section[0] != table_id_want) return;
+    const section_len = (@as(usize, section[1] & 0x0f) << 8) | section[2];
+    const total = 3 + section_len;
+    if (total > section.len) return;
+    const end = total - 4; // bez CRC
+    const net_desc_len = (@as(usize, section[8] & 0x0f) << 8) | section[9];
+    var pos: usize = 10 + net_desc_len;
+    if (pos + 2 > end) return;
+    pos += 2; // transport_stream_loop_length
+    while (pos + 6 <= end) {
+        const tsid = u16be(section, pos);
+        const onid = u16be(section, pos + 2);
+        const dlen = (@as(usize, section[pos + 4] & 0x0f) << 8) | section[pos + 5];
+        var d = pos + 6;
+        const dend = @min(d + dlen, end);
+        while (d + 2 <= dend) {
+            const tag = section[d];
+            const l = section[d + 1];
+            const body = section[d + 2 .. @min(d + 2 + l, dend)];
+            if (tag == 0x43 and body.len >= 11) { // satellite_delivery
+                const freq_10khz = bcd(body[0..4]);
+                const pos_bcd = bcd(body[4..6]);
+                const west_east = (body[6] >> 7) & 1;
+                const pol = (body[6] >> 5) & 3;
+                const sys = (body[6] >> 2) & 1;
+                const modl = body[6] & 3;
+                // SR: 7 cyfr BCD (jednostka 100 sym/s), ostatni polbajt bajtu 10 = FEC
+                const sr_100 = bcd(body[7..10]) * 10 + (body[10] >> 4);
+                const fec = body[10] & 0x0f;
+                const tpkey: u64 = (@as(u64, tsid) << 16) | onid;
+                if (seen_tp.get(tpkey) == null) {
+                    seen_tp.put(tpkey, {}) catch {};
+                    out.line("T {X:0>4}:{X:0>4} freq={d} pol={c} sr={d} fec={d} sys={s} pos={d}{s} mod={d}\n", .{
+                        tsid, onid, freq_10khz * 10, POLCHARS[pol], sr_100 * 100, fec,
+                        if (sys == 1) "S2" else "S", pos_bcd, if (west_east == 1) "E" else "W", modl,
+                    });
+                }
+            } else if (tag == lcn_desc and lcn_desc != 0) {
+                if (lcn_desc == 0x83) { // sid(2) visible(1b)+lcn(10b)
+                    var q: usize = 0;
+                    while (q + 4 <= body.len) : (q += 4) {
+                        const sid = u16be(body, q);
+                        const visible = (body[q + 2] >> 7) & 1;
+                        const lcn = (@as(u16, body[q + 2] & 0x03) << 8) | body[q + 3];
+                        emitLcn(out, seen_lcn, lcn_src, lcn, sid, tsid, onid, visible);
+                    }
+                } else { // 0x82 i pokrewne: sid(2) lcn(2)
+                    var q: usize = 0;
+                    while (q + 4 <= body.len) : (q += 4) {
+                        const sid = u16be(body, q);
+                        const lcn = u16be(body, q + 2);
+                        if (lcn > 0) emitLcn(out, seen_lcn, lcn_src, lcn, sid, tsid, onid, 1);
+                    }
+                }
+            }
+            d += 2 + l;
+        }
+        pos = dend;
+    }
+}
+
 fn findProvider(key: []const u8) ?Provider {
     for (PROVIDERS) |p| {
         if (std.mem.eql(u8, p.key, key)) return p;
@@ -286,6 +404,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var provider_key: []const u8 = "canalplus";
     var lnb = Lnb{};
     var secs: u32 = 8;
+    var scan_secs: u32 = 25;
+    var scr_slot: ?u8 = null;
+    var scr_freq: u32 = 0;
 
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.skip(); // argv0
@@ -306,6 +427,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             lnb.sw = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--secs")) {
             secs = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--scan-secs")) {
+            scan_secs = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--scr-slot")) {
+            scr_slot = try std.fmt.parseInt(u8, it.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--scr-freq")) {
+            scr_freq = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
         }
     }
 
@@ -344,8 +471,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = linux.close(fe);
     std.debug.print("[satscan] tuner: frontend{d}\n", .{chosen_fe});
 
-    try tune(fe, p, lnb);
-    const locked = waitLock(fe, secs);
+    const scr: ?Scr = if (scr_slot) |sl| blk: {
+        if (scr_freq == 0) {
+            std.debug.print("[satscan] --scr-slot wymaga --scr-freq <MHz>\n", .{});
+            return error.MissingArg;
+        }
+        break :blk Scr{ .slot = sl, .freq_mhz = scr_freq };
+    } else null;
+
+    try tune(fe, p, lnb, scr);
+    var locked = waitLock(fe, secs);
+    if (!locked and scr != null) { // unicable bywa kaprysny — druga proba
+        try tune(fe, p, lnb, scr);
+        locked = waitLock(fe, secs);
+    }
 
     var out = Out{};
     out.line("# provider={s} freq={d} pol={s} lock={d}\n", .{ p.name, p.freq, if (p.pol_h) "H" else "V", @intFromBool(locked) });
@@ -356,31 +495,74 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var dmxbuf: [64]u8 = undefined;
     const dmx_path = try std.fmt.bufPrintZ(&dmxbuf, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, demux });
-    const dfd = sysOpen(dmx_path, false) orelse return error.DemuxOpen;
-    defer _ = linux.close(dfd);
 
-    try setSectionFilter(dfd, 0x11, 0x42); // SDT actual
+    // trzy niezalezne filtry sekcji na tym samym urzadzeniu demux:
+    const fd_sdt = sysOpen(dmx_path, false) orelse return error.DemuxOpen;
+    defer _ = linux.close(fd_sdt);
+    try setSectionFilter(fd_sdt, 0x11, 0x42, 0xfb, null); // SDT actual (0x42) + other (0x46)
+
+    const fd_nit = sysOpen(dmx_path, false) orelse return error.DemuxOpen;
+    defer _ = linux.close(fd_nit);
+    try setSectionFilter(fd_nit, 0x10, 0x40, 0xff, null); // NIT actual
+
+    var fd_bat: i32 = -1;
+    if (p.bat_bouquet_id != 0) {
+        fd_bat = sysOpen(dmx_path, false) orelse return error.DemuxOpen;
+        try setSectionFilter(fd_bat, 0x11, 0x4a, 0xff, p.bat_bouquet_id); // BAT naszego bukietu
+    }
+    defer if (fd_bat >= 0) {
+        _ = linux.close(fd_bat);
+    };
 
     var seen = std.AutoHashMap(u32, void).init(alloc);
     defer seen.deinit();
+    var seen_tp = Seen.init(alloc);
+    defer seen_tp.deinit();
+    var seen_lcn = Seen.init(alloc);
+    defer seen_lcn.deinit();
 
     var onid: u16 = 0;
-    var secbuf: [4096]u8 = undefined;
-    var pfd = [_]linux.pollfd{.{ .fd = dfd, .events = linux.POLL.IN, .revents = 0 }};
+    var secbuf: [4200]u8 = undefined;
+    var fds_buf: [3]linux.pollfd = undefined;
+    var nfds: usize = 2;
+    fds_buf[0] = .{ .fd = fd_sdt, .events = linux.POLL.IN, .revents = 0 };
+    fds_buf[1] = .{ .fd = fd_nit, .events = linux.POLL.IN, .revents = 0 };
+    if (fd_bat >= 0) {
+        fds_buf[2] = .{ .fd = fd_bat, .events = linux.POLL.IN, .revents = 0 };
+        nfds = 3;
+    }
+    // Tablice SI powtarzaja sie cyklicznie, wiec konczymy po twardym czasie skanu
+    // (idle konczy wczesniej tylko przy braku sygnalu).
+    const idle_limit: u32 = 40; // 12s ciszy = koniec
+    const scan_iters: u32 = scan_secs * 4; // petle ~250ms+ (poll 300ms upper bound)
+    var iters: u32 = 0;
     var idle: u32 = 0;
-    while (idle < 30) {
-        const nr = linux.poll(&pfd, 1, 300);
+    while (idle < idle_limit and iters < scan_iters) : (iters += 1) {
+        const nr = linux.poll(&fds_buf, @intCast(nfds), 300);
         if (linux.errno(nr) != .SUCCESS) break;
         if (nr == 0) {
             idle += 1;
             continue;
         }
         idle = 0;
-        const n = linux.read(dfd, &secbuf, secbuf.len);
-        if (linux.errno(n) != .SUCCESS or n < 4) continue;
-        parseSdt(secbuf[0..n], &onid, &out, &seen);
+        var fi: usize = 0;
+        while (fi < nfds) : (fi += 1) {
+            if (fds_buf[fi].revents & linux.POLL.IN == 0) continue;
+            const n = linux.read(fds_buf[fi].fd, &secbuf, secbuf.len);
+            if (linux.errno(n) != .SUCCESS or n < 12) continue;
+            const sec = secbuf[0..n];
+            if (fds_buf[fi].fd == fd_sdt) {
+                parseSdt(sec, &onid, &out, &seen);
+            } else if (fds_buf[fi].fd == fd_nit) {
+                parseNitLike(sec, 0x40, p.nit_lcn_desc, "nit", &out, &seen_tp, &seen_lcn);
+            } else {
+                parseNitLike(sec, 0x4a, p.bat_lcn_desc, "bat", &out, &seen_tp, &seen_lcn);
+            }
+        }
     }
 
-    _ = linux.ioctl(dfd, DMX_STOP, 0);
-    std.debug.print("[satscan] uslug SDT: {d}\n", .{seen.count()});
+    _ = linux.ioctl(fd_sdt, DMX_STOP, 0);
+    _ = linux.ioctl(fd_nit, DMX_STOP, 0);
+    if (fd_bat >= 0) _ = linux.ioctl(fd_bat, DMX_STOP, 0);
+    std.debug.print("[satscan] uslugi={d} transpondery={d} lcn={d}\n", .{ seen.count(), seen_tp.count(), seen_lcn.count() });
 }
