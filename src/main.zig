@@ -100,6 +100,117 @@ const DMX_CHECK_CRC: u32 = 1;
 const DMX_IMMEDIATE_START: u32 = 4;
 const DMX_SET_FILTER = IOCTL.IOW('o', 43, dmx_sct_filter_params);
 const DMX_STOP = IOCTL.IO('o', 42);
+// STB extension (all enigma boxes): route demux input to a given frontend.
+const DMX_SET_SOURCE = IOCTL.IOW('o', 49, u32);
+
+fn demuxOpenFor(dmx_path: [*:0]const u8, frontend: u32) ?i32 {
+    const fd = sysOpen(dmx_path, true) orelse return null;
+    _ = linux.ioctl(fd, DMX_SET_SOURCE, @intFromPtr(&frontend)); // mainline lacks it - ignore errors
+    return fd;
+}
+
+// ---------- transponder queue & satellites.xml (full-satellite scan) ----------
+const XmlTp = struct { freq: u32, sr: u32, pol: u8, fec: u32, sys: u32, mod: u32 };
+
+const TpQueue = struct {
+    items: [512]XmlTp = undefined,
+    len: usize = 0,
+
+    // dedupe by frequency window (2 MHz) + polarisation
+    fn add(self: *TpQueue, tp: XmlTp) bool {
+        for (self.items[0..self.len]) |have| {
+            if (have.pol == tp.pol and absDiff(have.freq, tp.freq) < 2000) return false;
+        }
+        if (self.len >= self.items.len) return false;
+        self.items[self.len] = tp;
+        self.len += 1;
+        return true;
+    }
+};
+
+fn absDiff(a: u32, b: u32) u32 {
+    return if (a > b) a - b else b - a;
+}
+
+// enigma satellites.xml fec_inner -> Linux DVB API fe_code_rate
+fn mapXmlFec(x: u32) u32 {
+    return switch (x) {
+        1 => 1, // 1/2
+        2 => 2, // 2/3
+        3 => FEC_3_4,
+        4 => FEC_5_6,
+        5 => 7, // 7/8
+        6 => 8, // 8/9
+        7 => 10, // 3/5
+        8 => 4, // 4/5
+        9 => 11, // 9/10
+        else => FEC_AUTO,
+    };
+}
+
+// DVB satellite_delivery descriptor fec -> Linux DVB API
+fn mapDescFec(x: u32) u32 {
+    return switch (x) {
+        1 => 1,
+        2 => 2,
+        3 => FEC_3_4,
+        4 => FEC_5_6,
+        5 => 7,
+        6 => 8,
+        7 => 10,
+        8 => 4,
+        9 => 11,
+        else => FEC_AUTO,
+    };
+}
+
+fn xmlAttr(line: []const u8, name: []const u8) ?u32 {
+    var buf: [40]u8 = undefined;
+    const pat = std.fmt.bufPrint(&buf, "{s}=\"", .{name}) catch return null;
+    const i = std.mem.indexOf(u8, line, pat) orelse return null;
+    const rest = line[i + pat.len ..];
+    const j = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    return std.fmt.parseInt(u32, rest[0..j], 10) catch null;
+}
+
+// Minimal satellites.xml reader: transponders of the <sat position="POS"> block.
+fn parseSatellitesXml(path: [*:0]const u8, want_pos: u32, queue: *TpQueue) bool {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const buf = std.heap.page_allocator.alloc(u8, 2 * 1024 * 1024) catch return false;
+    defer std.heap.page_allocator.free(buf);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = linux.read(fd, buf.ptr + total, buf.len - total);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        total += n;
+    }
+    var in_sat = false;
+    var lines = std.mem.splitScalar(u8, buf[0..total], '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "<sat ") != null) {
+            in_sat = (xmlAttr(line, "position") orelse 0xffff) == want_pos;
+            continue;
+        }
+        if (std.mem.indexOf(u8, line, "</sat>") != null) {
+            if (in_sat) break;
+            in_sat = false;
+            continue;
+        }
+        if (!in_sat or std.mem.indexOf(u8, line, "<transponder") == null) continue;
+        const freq_khz = xmlAttr(line, "frequency") orelse continue; // xml value is already kHz
+        const sr = xmlAttr(line, "symbol_rate") orelse continue;
+        const pol: u8 = @intCast(xmlAttr(line, "polarization") orelse 0);
+        const fec = mapXmlFec(xmlAttr(line, "fec_inner") orelse 0);
+        const sys: u32 = if ((xmlAttr(line, "system") orelse 0) == 1) SYS_DVBS2 else SYS_DVBS;
+        const xmod = xmlAttr(line, "modulation") orelse 0;
+        const modl: u32 = if (xmod == 2) PSK_8 else QPSK;
+        _ = queue.add(.{ .freq = freq_khz, .sr = sr, .pol = pol, .fec = fec, .sys = sys, .mod = modl });
+    }
+    return queue.len > 0;
+}
 
 // ---------- provider table ----------
 const Provider = struct {
@@ -258,12 +369,12 @@ const Out = struct {
     }
 };
 
-fn parseSdt(section: []const u8, onid_out: *u16, out: *Out, seen: *std.AutoHashMap(u32, void)) void {
+fn parseSdt(section: []const u8, ids_out: *[2]u16, out: *Out, seen: *std.AutoHashMap(u32, void)) void {
     if (section.len < 12) return;
     if (section[0] != 0x42 and section[0] != 0x46) return;
     const tsid = u16be(section, 3);
     const onid = u16be(section, 8);
-    onid_out.* = onid;
+    ids_out.* = .{ tsid, onid };
     loop_fuse = 0;
     var pos: usize = 11; // past SDT header, into the service loop
     const section_len = (@as(usize, section[1] & 0x0f) << 8) | section[2];
@@ -271,6 +382,7 @@ fn parseSdt(section: []const u8, onid_out: *u16, out: *Out, seen: *std.AutoHashM
     while (pos + 5 <= end and pos + 5 <= section.len) {
         if (fuse("sdt-svc")) return;
         const sid = u16be(section, pos);
+        const free_ca = (section[pos + 3] >> 4) & 1;
         const desc_loop_len = (@as(usize, section[pos + 3] & 0x0f) << 8) | section[pos + 4];
         var d = pos + 5;
         const dend = d + desc_loop_len;
@@ -300,7 +412,7 @@ fn parseSdt(section: []const u8, onid_out: *u16, out: *Out, seen: *std.AutoHashM
         const key = (@as(u32, sid) << 16) | tsid;
         if (seen.get(key) == null) {
             seen.put(key, {}) catch {};
-            out.line("S {X:0>4}:{X:0>4}:{X:0>4} type={d} \"{s}\" \"{s}\"\n", .{ sid, tsid, onid, stype, name_buf[0..name_len], prov_buf[0..prov_len] });
+            out.line("S {X:0>4}:{X:0>4}:{X:0>4} type={d} ca={d} \"{s}\" \"{s}\"\n", .{ sid, tsid, onid, stype, free_ca, name_buf[0..name_len], prov_buf[0..prov_len] });
         }
         pos = dend;
     }
@@ -363,7 +475,7 @@ fn bcd(b: []const u8) u32 {
 // NIT (0x40) and BAT (0x4A) share the TS-loop structure; they differ in header
 // field meaning and where LCN lives. lcn_desc — which descriptor to treat as LCN.
 fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc: u8, lcn_src: []const u8,
-                out: *Out, seen_tp: *Seen, seen_lcn: *Seen) void {
+                out: *Out, seen_tp: *Seen, seen_lcn: *Seen, discover: ?*TpQueue) void {
     if (section.len < 12) return;
     if (section[0] != table_id_want) return;
     // Some demux drivers ignore the ext-id part of the hardware section filter
@@ -409,6 +521,10 @@ fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc
                         tsid, onid, freq_10khz * 10, POLCHARS[pol], sr_100 * 100, fec,
                         if (sys == 1) "S2" else "S", pos_bcd, if (west_east == 1) "E" else "W", modl,
                     });
+                }
+                if (discover) |q| {
+                    const added = q.add(.{ .freq = freq_10khz * 10, .sr = sr_100 * 100, .pol = pol, .fec = mapDescFec(fec), .sys = if (sys == 1) SYS_DVBS2 else SYS_DVBS, .mod = if (modl == 2) PSK_8 else QPSK });
+                    if (added) std.debug.print("[satscan] NIT discovered new tp {d} {c}\n", .{ freq_10khz * 10, POLCHARS[pol] });
                 }
             } else if (tag == lcn_desc and lcn_desc != 0) {
                 switch (lcn_desc) {
@@ -548,6 +664,90 @@ fn effectiveNim(nims: []const NimCfg, idx: usize) ?NimCfg {
     }
 }
 
+// Full-satellite scan: walk every transponder from the queue (seeded from
+// satellites.xml, extended live with NIT discoveries), grab SDT actual + NIT
+// on each, emit T/S lines. LCN is provider-specific, so none here.
+fn scanAll(fe: i32, fe_num: u32, dmx_path: [*:0]const u8, lnb: Lnb, scr: ?Scr, queue: *TpQueue,
+           lock_secs: u32, tp_secs: u32, max_tp: usize, pos_label: u32,
+           out: *Out, alloc: std.mem.Allocator) !void {
+    var seen = std.AutoHashMap(u32, void).init(alloc);
+    defer seen.deinit();
+    var seen_tp = Seen.init(alloc);
+    defer seen_tp.deinit();
+    var seen_lcn = Seen.init(alloc);
+    defer seen_lcn.deinit();
+
+    var locked: u32 = 0;
+    var tried: usize = 0;
+    var i: usize = 0;
+    while (i < queue.len) : (i += 1) {
+        if (max_tp != 0 and tried >= max_tp) break;
+        tried += 1;
+        const tp = queue.items[i];
+        const prov = Provider{ .key = "", .name = "", .freq = tp.freq, .sr = tp.sr, .pol_h = tp.pol == 0, .fec = tp.fec, .sys = tp.sys, .mod = tp.mod, .onid = 0, .tsid = 0 };
+        tune(fe, prov, lnb, scr) catch {
+            out.line("# tp {d}{c} sr={d} lock=err\n", .{ tp.freq, POLCHARS[tp.pol], tp.sr });
+            continue;
+        };
+        if (!waitLock(fe, lock_secs)) {
+            out.line("# tp {d}{c} sr={d} lock=0\n", .{ tp.freq, POLCHARS[tp.pol], tp.sr });
+            continue;
+        }
+        locked += 1;
+        out.line("# tp {d}{c} sr={d} lock=1\n", .{ tp.freq, POLCHARS[tp.pol], tp.sr });
+
+        const fd_sdt = demuxOpenFor(dmx_path, fe_num) orelse continue;
+        defer _ = linux.close(fd_sdt);
+        const fd_nit = demuxOpenFor(dmx_path, fe_num) orelse continue;
+        defer _ = linux.close(fd_nit);
+        setSectionFilter(fd_sdt, 0x11, 0x42, 0xff, null) catch continue; // SDT actual only
+        setSectionFilter(fd_nit, 0x10, 0x40, 0xff, null) catch continue;
+
+        var fds = [_]linux.pollfd{
+            .{ .fd = fd_sdt, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = fd_nit, .events = linux.POLL.IN, .revents = 0 },
+        };
+        var ids: [2]u16 = .{ 0, 0 };
+        var got_own_t = false;
+        var secbuf: [4200]u8 = undefined;
+        const t0 = nowMs();
+        while (nowMs() - t0 < @as(i64, tp_secs) * 1000) {
+            const nr = linux.poll(&fds, fds.len, 300);
+            if (linux.errno(nr) != .SUCCESS or nr == 0) continue;
+            for (&fds) |*pf| {
+                if (pf.revents & linux.POLL.IN == 0) continue;
+                var drained: u32 = 0;
+                while (drained < 256) : (drained += 1) {
+                    const n = linux.read(pf.fd, &secbuf, secbuf.len);
+                    if (linux.errno(n) != .SUCCESS or n == 0) break;
+                    if (n < 12) continue;
+                    const sec = secbuf[0..n];
+                    if (pf.fd == fd_sdt) {
+                        parseSdt(sec, &ids, out, &seen);
+                        if (!got_own_t and ids[0] != 0) {
+                            got_own_t = true;
+                            // synthetic T for the tuned tp (some tps carry no NIT)
+                            const tpkey: u64 = (@as(u64, ids[0]) << 16) | ids[1];
+                            if (seen_tp.get(tpkey) == null) {
+                                seen_tp.put(tpkey, {}) catch {};
+                                out.line("T {X:0>4}:{X:0>4} freq={d} pol={c} sr={d} fec={d} sys={s} pos={d}E mod={d}\n", .{
+                                    ids[0], ids[1], tp.freq, POLCHARS[tp.pol], tp.sr, tp.fec,
+                                    if (tp.sys == SYS_DVBS2) "S2" else "S", pos_label, if (tp.mod == PSK_8) @as(u32, 2) else 1,
+                                });
+                            }
+                        }
+                    } else if (sec[0] == 0x40) {
+                        parseNitLike(sec, 0x40, null, 0, "nit", out, &seen_tp, &seen_lcn, queue);
+                    }
+                }
+            }
+        }
+        _ = linux.ioctl(fd_sdt, DMX_STOP, 0);
+        _ = linux.ioctl(fd_nit, DMX_STOP, 0);
+    }
+    std.debug.print("[satscan] scan-all: tps={d} locked={d} services={d} transponders={d}\n", .{ tried, locked, seen.count(), seen_tp.count() });
+}
+
 fn batComplete(last: i32, got: *const [256]bool) bool {
     if (last < 0) return false; // no section seen yet
     var i: usize = 0;
@@ -577,6 +777,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var scr_slot: ?u8 = null;
     var scr_freq: u32 = 0;
     var settings_path: [:0]const u8 = "/etc/enigma2/settings";
+    var scan_all = false;
+    var satxml_path: [:0]const u8 = "/etc/tuxbox/satellites.xml";
+    var sat_pos: u32 = 130;
+    var tp_secs: u32 = 4;
+    var max_tp: usize = 0;
 
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.skip(); // argv0
@@ -605,13 +810,47 @@ pub fn main(init: std.process.Init.Minimal) !void {
             scr_freq = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--settings")) {
             settings_path = it.next() orelse return error.MissingArg;
+        } else if (std.mem.eql(u8, a, "--scan-all")) {
+            scan_all = true;
+        } else if (std.mem.eql(u8, a, "--satxml")) {
+            satxml_path = it.next() orelse return error.MissingArg;
+        } else if (std.mem.eql(u8, a, "--pos")) {
+            sat_pos = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--tp-secs")) {
+            tp_secs = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
+        } else if (std.mem.eql(u8, a, "--max-tp")) {
+            max_tp = try std.fmt.parseInt(usize, it.next() orelse return error.MissingArg, 10);
         }
     }
 
-    const p = findProvider(provider_key) orelse {
+    const p: Provider = if (scan_all)
+        // scan-all does not need a provider; home-TP fields are only used to
+        // probe the tuner, so borrow them from the first XML transponder later.
+        Provider{ .key = "scan", .name = "scan-all", .freq = 0, .sr = 0, .pol_h = false, .fec = FEC_AUTO, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 0, .tsid = 0 }
+    else findProvider(provider_key) orelse {
         std.debug.print("[satscan] unknown provider '{s}' (canalplus|polsat|nova|skyitalia|tivusat|vivacom)\n", .{provider_key});
         return error.BadProvider;
     };
+
+    var queue = TpQueue{};
+    var p_eff = p;
+    if (scan_all) {
+        if (!parseSatellitesXml(satxml_path, sat_pos, &queue)) {
+            // enigma often symlinks this into /etc/enigma2 as well
+            if (!parseSatellitesXml("/etc/enigma2/satellites.xml", sat_pos, &queue)) {
+                std.debug.print("[satscan] no transponders for pos={d} in {s}\n", .{ sat_pos, satxml_path });
+                return error.NoTransponders;
+            }
+        }
+        std.debug.print("[satscan] satellites.xml: {d} transponders for pos={d}\n", .{ queue.len, sat_pos });
+        const first = queue.items[0];
+        p_eff.freq = first.freq;
+        p_eff.sr = first.sr;
+        p_eff.pol_h = first.pol == 0;
+        p_eff.fec = first.fec;
+        p_eff.sys = first.sys;
+        p_eff.mod = first.mod;
+    }
 
     // Tuner configuration from enigma settings (unicable, 13E assignment).
     var nims = [_]NimCfg{.{}} ** 16;
@@ -660,13 +899,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else {
             std.debug.print("[satscan] frontend{d}: plain LNB\n", .{f});
         }
-        tune(fd, p, lnb, scr) catch {
+        if (scan_all) { // scan-all: first configured tuner that opens; locks counted per tp
+            fe = fd;
+            chosen_fe = f;
+            locked = true;
+            break;
+        }
+        tune(fd, p_eff, lnb, scr) catch {
             _ = linux.close(fd);
             continue;
         };
         var ok = waitLock(fd, secs);
         if (!ok and scr != null) { // unicable can be moody - one retry
-            tune(fd, p, lnb, scr) catch {};
+            tune(fd, p_eff, lnb, scr) catch {};
             ok = waitLock(fd, secs);
         }
         if (ok) {
@@ -685,6 +930,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = linux.close(fe);
     std.debug.print("[satscan] tuner: frontend{d}\n", .{chosen_fe});
 
+    var dmxbuf0: [64]u8 = undefined;
+    const dmx_path0 = try std.fmt.bufPrintZ(&dmxbuf0, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, demux });
+
+    if (scan_all) {
+        var out_sa = Out{};
+        out_sa.line("# scan-all pos={d} tps={d} frontend={d}\n", .{ sat_pos, queue.len, chosen_fe });
+        const scr_used: ?Scr = if (cli_scr != null) cli_scr else if (have_settings) blk: {
+            if (effectiveNim(&nims, chosen_fe)) |cfg| {
+                if (cfg.unicable and cfg.scr_freq != 0) break :blk Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
+            }
+            break :blk null;
+        } else null;
+        try scanAll(fe, chosen_fe, dmx_path0, lnb, scr_used, &queue, secs, tp_secs, max_tp, sat_pos, &out_sa, alloc);
+        return;
+    }
+
     var out = Out{};
     out.line("# provider={s} freq={d} pol={s} lock={d} frontend={d}\n", .{ p.name, p.freq, if (p.pol_h) "H" else "V", @intFromBool(locked), chosen_fe });
 
@@ -692,17 +953,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const dmx_path = try std.fmt.bufPrintZ(&dmxbuf, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, demux });
 
     // three independent section filters on the same demux device:
-    const fd_sdt = sysOpen(dmx_path, true) orelse return error.DemuxOpen;
+    const fd_sdt = demuxOpenFor(dmx_path, chosen_fe) orelse return error.DemuxOpen;
     defer _ = linux.close(fd_sdt);
     try setSectionFilter(fd_sdt, 0x11, 0x42, 0xfb, null); // SDT actual (0x42) + other (0x46)
 
-    const fd_nit = sysOpen(dmx_path, true) orelse return error.DemuxOpen;
+    const fd_nit = demuxOpenFor(dmx_path, chosen_fe) orelse return error.DemuxOpen;
     defer _ = linux.close(fd_nit);
     try setSectionFilter(fd_nit, 0x10, 0x40, if (p.nit_other) 0xfe else 0xff, null); // NIT actual (+other)
 
     var fd_bat: i32 = -1;
     if (p.bat_bouquet_id != 0) {
-        fd_bat = sysOpen(dmx_path, true) orelse return error.DemuxOpen;
+        fd_bat = demuxOpenFor(dmx_path, chosen_fe) orelse return error.DemuxOpen;
         try setSectionFilter(fd_bat, 0x11, 0x4a, 0xff, p.bat_bouquet_id); // BAT of our bouquet
     }
     defer if (fd_bat >= 0) {
@@ -716,7 +977,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var seen_lcn = Seen.init(alloc);
     defer seen_lcn.deinit();
 
-    var onid: u16 = 0;
+    var ids: [2]u16 = .{ 0, 0 };
     var secbuf: [4200]u8 = undefined;
     var fds_buf: [3]linux.pollfd = undefined;
     var nfds: usize = 2;
@@ -766,10 +1027,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (n < 12) continue;
             const sec = secbuf[0..n];
             if (fds_buf[fi].fd == fd_sdt) {
-                parseSdt(sec, &onid, &out, &seen);
+                parseSdt(sec, &ids, &out, &seen);
             } else if (fds_buf[fi].fd == fd_nit) {
                 if (sec[0] == 0x40 or (p.nit_other and sec[0] == 0x41)) {
-                    parseNitLike(sec, sec[0], null, p.nit_lcn_desc, "nit", &out, &seen_tp, &seen_lcn);
+                    parseNitLike(sec, sec[0], null, p.nit_lcn_desc, "nit", &out, &seen_tp, &seen_lcn, null);
                 }
             } else {
                 if (sec.len > 7 and u16be(sec, 3) == p.bat_bouquet_id) {
@@ -781,7 +1042,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     }
                     bat_got[sec[6]] = true;
                 }
-                parseNitLike(sec, 0x4a, p.bat_bouquet_id, p.bat_lcn_desc, "bat", &out, &seen_tp, &seen_lcn);
+                parseNitLike(sec, 0x4a, p.bat_bouquet_id, p.bat_lcn_desc, "bat", &out, &seen_tp, &seen_lcn, null);
             }
             }
         }

@@ -22,8 +22,15 @@ Supported providers (`--provider`):
 ## Usage
 
 ```sh
-satscan --provider <key> [options] > list.txt
+satscan --provider <key> [options] > list.txt      # one platform with LCN
+satscan --scan-all [options] > full.txt            # whole satellite from satellites.xml
 ```
+
+`--scan-all` walks every transponder of the configured orbital position from
+`/etc/tuxbox/satellites.xml` (`--pos`, default 130 = 13.0E), extends the queue
+live with transponders discovered in NIT, and captures SDT actual on each
+(~7 min for all of 13.0E). Extra options: `--tp-secs` (per-TP capture window,
+default 4), `--max-tp N` (limit, for quick tests), `--satxml PATH`.
 
 That is usually all — the tool configures itself:
 
@@ -54,14 +61,14 @@ One line per record on stdout, diagnostics on stderr:
 ```
 # provider=Polsat Box freq=12188000 pol=V lock=1 frontend=0
 T 1CE8:0071 freq=12188000 pol=V sr=27500000 fec=3 sys=S2 pos=130E mod=2
-S 3391:3390:0071 type=1 "Polsat HD" "Cyfrowy Polsat S.A."
+S 3391:3390:0071 type=1 ca=1 "Polsat HD" "Cyfrowy Polsat S.A."
 L 1 3391:3390:0071 visible=1 src=nit
 ```
 
 - `T` — transponder from NIT (`tsid:onid`, frequency kHz, polarisation, symbol
   rate, DVB FEC code, S/S2, orbital position, modulation),
-- `S` — service from SDT actual+other (`sid:tsid:onid`, DVB service type,
-  name, provider),
+- `S` — service from SDT (`sid:tsid:onid`, DVB service type, `ca` free/scrambled
+  flag, name, provider),
 - `L` — logical channel number (`src=nit` — Polsat, descriptor 0x82;
   `src=bat` — Canal+, descriptor 0x83 in bouquet 0x2020, with the
   visible-service flag).

@@ -21,8 +21,15 @@ Obsługiwani providerzy (`--provider`):
 ## Użycie
 
 ```sh
-satscan --provider <klucz> [opcje] > lista.txt
+satscan --provider <klucz> [opcje] > lista.txt     # jedna platforma z LCN
+satscan --scan-all [opcje] > pelny.txt             # caly satelita z satellites.xml
 ```
+
+`--scan-all` przechodzi wszystkie transpondery pozycji orbitalnej z
+`/etc/tuxbox/satellites.xml` (`--pos`, domyślnie 130 = 13.0E), rozszerza kolejkę
+na żywo o transpondery odkryte w NIT i zbiera SDT actual z każdego
+(~7 min dla całego 13.0E). Dodatkowe opcje: `--tp-secs` (okno na TP, domyślnie 4),
+`--max-tp N` (limit, do szybkich testów), `--satxml ŚCIEŻKA`.
 
 Zwykle to wszystko — narzędzie konfiguruje się samo:
 
@@ -53,14 +60,14 @@ Jedna linia na rekord na stdout, diagnostyka na stderr:
 ```
 # provider=Polsat Box freq=12188000 pol=V lock=1 frontend=0
 T 1CE8:0071 freq=12188000 pol=V sr=27500000 fec=3 sys=S2 pos=130E mod=2
-S 3391:3390:0071 type=1 "Polsat HD" "Cyfrowy Polsat S.A."
+S 3391:3390:0071 type=1 ca=1 "Polsat HD" "Cyfrowy Polsat S.A."
 L 1 3391:3390:0071 visible=1 src=nit
 ```
 
 - `T` — transponder z NIT (`tsid:onid`, częstotliwość kHz, polaryzacja,
   symbol rate, kod FEC DVB, S/S2, pozycja orbitalna, modulacja),
-- `S` — usługa z SDT actual+other (`sid:tsid:onid`, typ usługi DVB, nazwa,
-  provider),
+- `S` — usługa z SDT (`sid:tsid:onid`, typ usługi DVB, flaga `ca` FTA/kodowany,
+  nazwa, provider),
 - `L` — numer logiczny kanału (`src=nit` — Polsat, deskryptor 0x82;
   `src=bat` — Canal+, deskryptor 0x83 w bukiecie 0x2020, z flagą
   visible-service).
