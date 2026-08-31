@@ -116,11 +116,18 @@ const Provider = struct {
     bat_bouquet_id: u16 = 0, // 0 = no BAT scan
     bat_lcn_desc: u8 = 0, // LCN descriptor in BAT (Canal+: 0x83)
     nit_lcn_desc: u8 = 0, // LCN descriptor in NIT (Polsat: 0x82)
+    nit_other: bool = false, // also read NIT-other 0x41 (Tivusat keeps LCN there)
 };
+
+const FEC_2_3: u32 = 2;
 
 const PROVIDERS = [_]Provider{
     .{ .key = "canalplus", .name = "Platforma Canal+", .freq = 10719000, .sr = 27500000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 318, .tsid = 11000, .bat_bouquet_id = 0x2020, .bat_lcn_desc = 0x83 },
     .{ .key = "polsat", .name = "Polsat Box", .freq = 12188000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 113, .tsid = 7400, .nit_lcn_desc = 0x82 },
+    .{ .key = "nova", .name = "Nova Greece", .freq = 11823000, .sr = 27500000, .pol_h = true, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 318, .tsid = 5500, .bat_bouquet_id = 0x0001, .bat_lcn_desc = 0x93 },
+    .{ .key = "skyitalia", .name = "Sky Italia", .freq = 11881000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS, .mod = QPSK, .onid = 64511, .tsid = 5800, .bat_bouquet_id = 0x6250, .bat_lcn_desc = 0xb1 },
+    .{ .key = "tivusat", .name = "Tivusat", .freq = 10992000, .sr = 27500000, .pol_h = false, .fec = FEC_2_3, .sys = SYS_DVBS, .mod = QPSK, .onid = 318, .tsid = 12400, .nit_lcn_desc = 0x83, .nit_other = true },
+    .{ .key = "vivacom", .name = "Vivacom", .freq = 12713000, .sr = 30000000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 213, .tsid = 10000, .bat_bouquet_id = 0x6158, .bat_lcn_desc = 0xe2 },
 };
 
 // ---------- I/O on raw syscalls (no libc) ----------
@@ -134,6 +141,14 @@ fn sysOpen(path: [*:0]const u8, nonblock: bool) ?i32 {
 
 fn sysWrite(fd: i32, s: []const u8) void {
     _ = linux.write(fd, s.ptr, s.len);
+}
+
+fn nowMs() i64 {
+    // gettimeofday: ancient syscall, works on every kernel these boxes run
+    // (clock_gettime via zig can hit vdso/time64 paths that old kernels lack).
+    var tv: linux.timeval = .{ .sec = 0, .usec = 0 };
+    _ = linux.gettimeofday(&tv, null);
+    return @as(i64, tv.sec) * 1000 + @divTrunc(@as(i64, tv.usec), 1000);
 }
 
 fn sleepMs(ms: u32) void {
@@ -249,10 +264,12 @@ fn parseSdt(section: []const u8, onid_out: *u16, out: *Out, seen: *std.AutoHashM
     const tsid = u16be(section, 3);
     const onid = u16be(section, 8);
     onid_out.* = onid;
+    loop_fuse = 0;
     var pos: usize = 11; // past SDT header, into the service loop
     const section_len = (@as(usize, section[1] & 0x0f) << 8) | section[2];
     const end = 3 + section_len - 4; // excluding CRC
     while (pos + 5 <= end and pos + 5 <= section.len) {
+        if (fuse("sdt-svc")) return;
         const sid = u16be(section, pos);
         const desc_loop_len = (@as(usize, section[pos + 3] & 0x0f) << 8) | section[pos + 4];
         var d = pos + 5;
@@ -263,6 +280,7 @@ fn parseSdt(section: []const u8, onid_out: *u16, out: *Out, seen: *std.AutoHashM
         var prov_buf: [64]u8 = undefined;
         var prov_len: usize = 0;
         while (d + 2 <= dend and d + 2 <= section.len) {
+            if (fuse("sdt-desc")) return;
             const tag = section[d];
             const dlen = section[d + 1];
             if (tag == 0x48 and d + 2 + dlen <= section.len) { // service_descriptor
@@ -277,7 +295,7 @@ fn parseSdt(section: []const u8, onid_out: *u16, out: *Out, seen: *std.AutoHashM
                 q += 1;
                 name_len = copyName(name_buf[0..], section[q .. q + nl]);
             }
-            d += 2 + dlen;
+            d += 2 + @as(usize, dlen); // NOTE: '2 + dlen' alone wraps in u8
         }
         const key = (@as(u32, sid) << 16) | tsid;
         if (seen.get(key) == null) {
@@ -310,11 +328,28 @@ fn copyName(dst: []u8, src: []const u8) usize {
 const POLCHARS = "HVLR";
 const Seen = std.AutoHashMap(u64, void);
 
-fn emitLcn(out: *Out, seen: *Seen, src: []const u8, lcn: u16, sid: u16, tsid: u16, onid: u16, visible: u8) void {
-    const key: u64 = (@as(u64, sid) << 48) | (@as(u64, tsid) << 32) | (@as(u64, onid) << 16) | lcn;
+// Parser loop fuse: any inner loop exceeding this many turns per section is a
+// bug — report and bail out of the section instead of spinning forever.
+var loop_fuse: u32 = 0;
+fn fuse(where: []const u8) bool {
+    loop_fuse += 1;
+    if (loop_fuse > 200_000) {
+        std.debug.print("[satscan] LOOP FUSE tripped in {s}\n", .{where});
+        return true;
+    }
+    return false;
+}
+
+fn emitLcn(out: *Out, seen: *Seen, src: []const u8, lcn: u16, sid: u16, tsid: u16, onid: u16, visible: u8, region: ?u8) void {
+    const r: u64 = if (region) |rg| rg else 0xff;
+    const key: u64 = (@as(u64, r) << 56) | (@as(u64, sid) << 40) | (@as(u64, tsid) << 24) | (@as(u64, onid & 0xff) << 16) | lcn;
     if (seen.get(key) != null) return;
     seen.put(key, {}) catch {};
-    out.line("L {d} {X:0>4}:{X:0>4}:{X:0>4} visible={d} src={s}\n", .{ lcn, sid, tsid, onid, visible, src });
+    if (region) |rg| {
+        out.line("L {d} {X:0>4}:{X:0>4}:{X:0>4} visible={d} region={d} src={s}\n", .{ lcn, sid, tsid, onid, visible, rg, src });
+    } else {
+        out.line("L {d} {X:0>4}:{X:0>4}:{X:0>4} visible={d} src={s}\n", .{ lcn, sid, tsid, onid, visible, src });
+    }
 }
 
 fn bcd(b: []const u8) u32 {
@@ -340,11 +375,13 @@ fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc
     const total = 3 + section_len;
     if (total > section.len) return;
     const end = total - 4; // bez CRC
+    loop_fuse = 0;
     const net_desc_len = (@as(usize, section[8] & 0x0f) << 8) | section[9];
     var pos: usize = 10 + net_desc_len;
     if (pos + 2 > end) return;
     pos += 2; // transport_stream_loop_length
     while (pos + 6 <= end) {
+        if (fuse("nitlike-ts")) return;
         const tsid = u16be(section, pos);
         const onid = u16be(section, pos + 2);
         const dlen = (@as(usize, section[pos + 4] & 0x0f) << 8) | section[pos + 5];
@@ -353,6 +390,7 @@ fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc
         while (d + 2 <= dend) {
             const tag = section[d];
             const l = section[d + 1];
+            if (fuse("nitlike-desc")) return;
             const body = section[d + 2 .. @min(d + 2 + l, dend)];
             if (tag == 0x43 and body.len >= 11) { // satellite_delivery
                 const freq_10khz = bcd(body[0..4]);
@@ -373,24 +411,48 @@ fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc
                     });
                 }
             } else if (tag == lcn_desc and lcn_desc != 0) {
-                if (lcn_desc == 0x83) { // sid(2), visible flag(1b)+lcn(10b)
-                    var q: usize = 0;
-                    while (q + 4 <= body.len) : (q += 4) {
-                        const sid = u16be(body, q);
-                        const visible = (body[q + 2] >> 7) & 1;
-                        const lcn = (@as(u16, body[q + 2] & 0x03) << 8) | body[q + 3];
-                        emitLcn(out, seen_lcn, lcn_src, lcn, sid, tsid, onid, visible);
-                    }
-                } else { // 0x82 and friends: sid(2) lcn(2)
-                    var q: usize = 0;
-                    while (q + 4 <= body.len) : (q += 4) {
-                        const sid = u16be(body, q);
-                        const lcn = u16be(body, q + 2);
-                        if (lcn > 0) emitLcn(out, seen_lcn, lcn_src, lcn, sid, tsid, onid, 1);
-                    }
+                switch (lcn_desc) {
+                    0x83 => { // sid(2), visible flag(1b) + lcn(10b)
+                        var q: usize = 0;
+                        while (q + 4 <= body.len) : (q += 4) {
+                            const sid = u16be(body, q);
+                            const visible = (body[q + 2] >> 7) & 1;
+                            const lcn = (@as(u16, body[q + 2] & 0x03) << 8) | body[q + 3];
+                            emitLcn(out, seen_lcn, lcn_src, lcn, sid, tsid, onid, visible, null);
+                        }
+                    },
+                    0xb1 => { // Sky private: 2-byte header (region in byte 1), then 9-byte entries
+                        // NOTE: no `continue` here — it would skip the `d += 2 + l`
+                        // advance below and spin forever on the same descriptor.
+                        if (body.len >= 2) {
+                            const region = body[1];
+                            var q: usize = 2;
+                            while (q + 9 <= body.len) : (q += 9) {
+                                const sid = u16be(body, q);
+                                const sky_id = u16be(body, q + 5);
+                                if (sky_id > 0 and sky_id != 0xffff) emitLcn(out, seen_lcn, lcn_src, sky_id, sid, tsid, onid, 1, region);
+                            }
+                        }
+                    },
+                    0xe2 => { // sid(2), lcn(10b)
+                        var q: usize = 0;
+                        while (q + 4 <= body.len) : (q += 4) {
+                            const sid = u16be(body, q);
+                            const lcn = (@as(u16, body[q + 2] & 0x03) << 8) | body[q + 3];
+                            if (lcn > 0) emitLcn(out, seen_lcn, lcn_src, lcn, sid, tsid, onid, 1, null);
+                        }
+                    },
+                    else => { // 0x82, 0x93 and friends: sid(2) lcn(2)
+                        var q: usize = 0;
+                        while (q + 4 <= body.len) : (q += 4) {
+                            const sid = u16be(body, q);
+                            const lcn = u16be(body, q + 2);
+                            if (lcn > 0) emitLcn(out, seen_lcn, lcn_src, lcn, sid, tsid, onid, 1, null);
+                        }
+                    },
                 }
             }
-            d += 2 + l;
+            d += 2 + @as(usize, l); // NOTE: '2 + l' alone wraps in u8 (254 -> 0)
         }
         pos = dend;
     }
@@ -547,7 +609,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const p = findProvider(provider_key) orelse {
-        std.debug.print("[satscan] unknown provider '{s}' (canalplus|polsat)\n", .{provider_key});
+        std.debug.print("[satscan] unknown provider '{s}' (canalplus|polsat|nova|skyitalia|tivusat|vivacom)\n", .{provider_key});
         return error.BadProvider;
     };
 
@@ -630,17 +692,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const dmx_path = try std.fmt.bufPrintZ(&dmxbuf, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, demux });
 
     // three independent section filters on the same demux device:
-    const fd_sdt = sysOpen(dmx_path, false) orelse return error.DemuxOpen;
+    const fd_sdt = sysOpen(dmx_path, true) orelse return error.DemuxOpen;
     defer _ = linux.close(fd_sdt);
     try setSectionFilter(fd_sdt, 0x11, 0x42, 0xfb, null); // SDT actual (0x42) + other (0x46)
 
-    const fd_nit = sysOpen(dmx_path, false) orelse return error.DemuxOpen;
+    const fd_nit = sysOpen(dmx_path, true) orelse return error.DemuxOpen;
     defer _ = linux.close(fd_nit);
-    try setSectionFilter(fd_nit, 0x10, 0x40, 0xff, null); // NIT actual
+    try setSectionFilter(fd_nit, 0x10, 0x40, if (p.nit_other) 0xfe else 0xff, null); // NIT actual (+other)
 
     var fd_bat: i32 = -1;
     if (p.bat_bouquet_id != 0) {
-        fd_bat = sysOpen(dmx_path, false) orelse return error.DemuxOpen;
+        fd_bat = sysOpen(dmx_path, true) orelse return error.DemuxOpen;
         try setSectionFilter(fd_bat, 0x11, 0x4a, 0xff, p.bat_bouquet_id); // BAT of our bouquet
     }
     defer if (fd_bat >= 0) {
@@ -668,18 +730,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // BAT can cycle slower than the cap, so we track its section completeness
     // (section_number/last_section_number) and keep going until every section
     // arrived (hard cap = 4x scan time). Idle ends early only on a quiet mux.
+    // Real wall-clock time; each ready fd is drained to EAGAIN (busy muxes push
+    // sections faster than one-read-per-poll).
     const idle_limit: u32 = 40; // 12s of silence = done
-    const scan_iters: u32 = scan_secs * 4; // ~250ms+ per loop (poll 300ms upper bound)
-    const hard_iters: u32 = scan_iters * 4;
     var bat_version: i32 = -1;
     var bat_last: i32 = -1;
     var bat_got = [_]bool{false} ** 256;
-    var iters: u32 = 0;
+    const t0 = nowMs();
     var idle: u32 = 0;
-    while (idle < idle_limit and iters < hard_iters) : (iters += 1) {
-        if (iters >= scan_iters) {
+    while (idle < idle_limit) {
+        const elapsed = nowMs() - t0;
+        if (elapsed >= @as(i64, scan_secs) * 1000) {
             const bat_done = fd_bat < 0 or batComplete(bat_last, &bat_got);
-            if (bat_done) break;
+            if (bat_done or elapsed >= @as(i64, scan_secs) * 4000) break;
         }
         const nr = linux.poll(&fds_buf, @intCast(nfds), 300);
         if (linux.errno(nr) != .SUCCESS) break;
@@ -691,13 +754,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var fi: usize = 0;
         while (fi < nfds) : (fi += 1) {
             if (fds_buf[fi].revents & linux.POLL.IN == 0) continue;
+            // Drain the fd, but bounded: old drivers can return 0 on buffer
+            // overflow (busy-loop bait), and the outer loop must keep checking
+            // the clock.
+            var drained: u32 = 0;
+            while (drained < 256) : (drained += 1) {
             const n = linux.read(fds_buf[fi].fd, &secbuf, secbuf.len);
-            if (linux.errno(n) != .SUCCESS or n < 12) continue;
+            const e = linux.errno(n);
+            if (e != .SUCCESS) break; // AGAIN = drained; other errors: stop this fd for now
+            if (n == 0) break;
+            if (n < 12) continue;
             const sec = secbuf[0..n];
             if (fds_buf[fi].fd == fd_sdt) {
                 parseSdt(sec, &onid, &out, &seen);
             } else if (fds_buf[fi].fd == fd_nit) {
-                parseNitLike(sec, 0x40, null, p.nit_lcn_desc, "nit", &out, &seen_tp, &seen_lcn);
+                if (sec[0] == 0x40 or (p.nit_other and sec[0] == 0x41)) {
+                    parseNitLike(sec, sec[0], null, p.nit_lcn_desc, "nit", &out, &seen_tp, &seen_lcn);
+                }
             } else {
                 if (sec.len > 7 and u16be(sec, 3) == p.bat_bouquet_id) {
                     const ver: i32 = (sec[5] >> 1) & 0x1f;
@@ -709,6 +782,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     bat_got[sec[6]] = true;
                 }
                 parseNitLike(sec, 0x4a, p.bat_bouquet_id, p.bat_lcn_desc, "bat", &out, &seen_tp, &seen_lcn);
+            }
             }
         }
     }

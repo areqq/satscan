@@ -1,17 +1,28 @@
 # satscan
 
-Standalone, dependency-free binary that scans **Polsat Box** and **Platforma Canal+**
-channel line-ups straight off a DVB-S2 tuner (Hot Bird 13.0E) and prints them as
-plain text — service names, transponders and the operator's logical channel
-numbers (LCN). Written from scratch in **Zig 0.16**, raw Linux syscalls only
-(no libc, static musl binaries ~150–230 KB).
+Standalone, dependency-free binary that scans channel line-ups of the Hot Bird
+13.0E platforms straight off a DVB-S/S2 tuner and prints them as plain text —
+service names, transponders and the operator's logical channel numbers (LCN).
+Written from scratch in **Zig 0.16**, raw Linux syscalls only (no libc, static
+musl binaries ~150–230 KB).
+
+Supported providers (`--provider`):
+
+| key | platform | LCN source |
+|---|---|---|
+| `canalplus` | Platforma Canal+ (PL) | BAT 0x2020, descriptor 0x83 |
+| `polsat` | Polsat Box (PL) | NIT, descriptor 0x82 |
+| `skyitalia` | Sky Italia | BAT 0x6250, Sky private 0xB1 (with regions) |
+| `tivusat` | Tivùsat (IT) | NIT actual+other, descriptor 0x83 |
+| `nova` | Nova (GR) | BAT 0x0001, descriptor 0x93 |
+| `vivacom` | Vivacom (BG) | BAT 0x6158, descriptor 0xE2 |
 
 *Dokumentacja po polsku: [README.pl.md](README.pl.md)*
 
 ## Usage
 
 ```sh
-satscan --provider canalplus|polsat [options] > list.txt
+satscan --provider <key> [options] > list.txt
 ```
 
 That is usually all — the tool configures itself:
