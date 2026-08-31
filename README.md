@@ -108,6 +108,12 @@ Two portable flavours, chosen the hard way:
 CI builds both flavours on every push and publishes GitHub Releases with
 checksums on `satscan-v*` tags.
 
+## License
+
+GPL-2.0 — see [LICENSE](LICENSE). The provider parameters and descriptor
+layouts were derived from [SatScanLcn](https://github.com/Huevos/SatScanLcn)
+(GPLv2), so this project keeps the same licence.
+
 ## Tested on
 
 | box | arch | dish setup |

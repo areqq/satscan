@@ -108,6 +108,12 @@ Dwa przenośne warianty — dobrane po bolesnych testach:
 CI buduje oba warianty przy każdym pushu, a na tagach `satscan-v*` publikuje
 GitHub Release z sumami kontrolnymi.
 
+## Licencja
+
+GPL-2.0 — patrz [LICENSE](LICENSE). Parametry providerów i układy deskryptorów
+pochodzą z [SatScanLcn](https://github.com/Huevos/SatScanLcn) (GPLv2), więc ten
+projekt zachowuje tę samą licencję.
+
 ## Przetestowane na
 
 | dekoder | arch | instalacja |

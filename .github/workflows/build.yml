@@ -1,0 +1,68 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          tar xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Build (armhf without NEON + mipsel r1)
+        run: |
+          zig version
+          zig build
+          file zig-out/bin/satscan-armhf zig-out/bin/satscan-mipsel
+
+      - name: Checksums
+        working-directory: zig-out/bin
+        run: sha256sum satscan-* | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: satscan-binaries
+          path: |
+            zig-out/bin/satscan-*
+            zig-out/bin/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: satscan-binaries
+          path: dist
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" dist/satscan-armhf dist/satscan-mipsel dist/SHA256SUMS \
+            --title "satscan $tag" \
+            --notes "Static, dependency-free scanner of Hot Bird 13.0E platform line-ups (Canal+, Polsat Box, Sky Italia, Tivùsat, Nova, Vivacom) plus full-satellite scan.
+
+          **satscan-armhf** — ARMv7 without NEON (runs on every ARM Enigma2 box)
+          **satscan-mipsel** — MIPS32 r1 (older Broadcom boxes)
+
+          \`satscan --provider canalplus\` · \`satscan --scan-all\` — tuner, unicable and LNB settings are picked up from /etc/enigma2/settings automatically."
