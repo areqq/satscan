@@ -70,6 +70,7 @@ Options:
 | `--settings PATH` | enigma settings path (default `/etc/enigma2/settings`) |
 | `--scr-slot N --scr-freq MHz` | force Unicable EN50494 (overrides settings) |
 | `--diseqc-port N` | force committed DiSEqC port 0–3 (overrides settings) |
+| `--dry-run` | print the dish/tuner decision (positions, DiSEqC port, unicable) and exit without touching the tuner |
 | `--lnb-lo/hi/sw kHz` | universal LNB parameters (defaults 9750/10600/11700 MHz) |
 | `--secs S` | LOCK wait per tuner (default 8) |
 | `--scan-secs S` | base scan time (default 25; extends up to 4× until BAT completes) |

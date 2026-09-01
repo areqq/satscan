@@ -69,6 +69,7 @@ Opcje:
 | `--settings ŚCIEŻKA` | ustawienia enigmy (domyślnie `/etc/enigma2/settings`) |
 | `--scr-slot N --scr-freq MHz` | wymuszenie Unicable EN50494 (nadpisuje settings) |
 | `--diseqc-port N` | wymuszenie portu committed DiSEqC 0–3 (nadpisuje settings) |
+| `--dry-run` | wypisuje decyzję o antenie/tunerze (pozycje, port DiSEqC, unicable) i kończy, nie dotykając tunera |
 | `--lnb-lo/hi/sw kHz` | parametry uniwersalnego LNB (domyślnie 9750/10600/11700 MHz) |
 | `--secs S` | czekanie na LOCK per tuner (domyślnie 8) |
 | `--scan-secs S` | bazowy czas skanu (domyślnie 25; wydłuża się do 4× aż BAT będzie kompletny) |

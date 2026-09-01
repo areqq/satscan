@@ -105,7 +105,9 @@ const DMX_SET_SOURCE = IOCTL.IOW('o', 49, u32);
 
 fn demuxOpenFor(dmx_path: [*:0]const u8, frontend: u32) ?i32 {
     const fd = sysOpen(dmx_path, true) orelse return null;
-    _ = linux.ioctl(fd, DMX_SET_SOURCE, @intFromPtr(&frontend)); // mainline lacks it - ignore errors
+    // Only reroute when we are not on the demux's default input (frontend0):
+    // some STB drivers disturb already-armed filters when re-sourced.
+    if (frontend > 0) _ = linux.ioctl(fd, DMX_SET_SOURCE, @intFromPtr(&frontend));
     return fd;
 }
 
@@ -621,9 +623,15 @@ const NimCfg = struct {
     ports: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS,
     has_port: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
     nsat: usize = 0,
-    unicable: bool = false,
+    unicable: bool = false, // from the advanced LNB block
     scr_slot: u8 = 0,
     scr_freq: u32 = 0,
+
+    // The advanced LNB block (incl. unicable) only applies in advanced mode;
+    // images keep stale advanced config around while running in simple mode.
+    fn usesUnicable(self: NimCfg) bool {
+        return self.unicable and self.scr_freq != 0 and self.mode == .advanced;
+    }
 
     fn addSat(self: *NimCfg, pos: u32, port: ?u8) void {
         var i: usize = 0;
@@ -708,7 +716,9 @@ fn parseSettings(path: [*:0]const u8, nims: []NimCfg) bool {
         if (idx >= nims.len) continue;
         const c = &nims[idx];
         c.seen = true;
-        const kv = rest[dot + 1 ..];
+        var kv = rest[dot + 1 ..];
+        // newer images group keys per tuner type: config.Nims.0.dvbs.diseqcA=130
+        if (std.mem.startsWith(u8, kv, "dvbs.")) kv = kv["dvbs.".len..];
         if (std.mem.startsWith(u8, kv, "configMode=")) {
             const v = valueAfterEq(kv);
             c.mode = if (std.mem.eql(u8, v, "simple")) .simple
@@ -883,6 +893,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var scr_freq: u32 = 0;
     var settings_path: [:0]const u8 = "/etc/enigma2/settings";
     var cli_port: ?u8 = null;
+    var dry_run = false;
     var scan_all = false;
     var satxml_path: [:0]const u8 = "/etc/tuxbox/satellites.xml";
     var sat_pos: u32 = 130;
@@ -916,6 +927,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             scr_freq = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--settings")) {
             settings_path = it.next() orelse return error.MissingArg;
+        } else if (std.mem.eql(u8, a, "--dry-run")) {
+            dry_run = true;
         } else if (std.mem.eql(u8, a, "--diseqc-port")) {
             cli_port = try std.fmt.parseInt(u8, it.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--scan-all")) {
@@ -976,6 +989,44 @@ pub fn main(init: std.process.Init.Minimal) !void {
         break :blk Scr{ .slot = sl, .freq_mhz = scr_freq };
     } else null;
 
+    if (dry_run) {
+        // Diagnostics only: report what the dish setup implies, touch nothing.
+        var out_d = Out{};
+        out_d.line("# dry-run target={d}.{d}E provider={s} freq={d} pol={c}\n", .{
+            target_pos / 10, target_pos % 10, p.name, p.freq, @as(u8, if (p.pol_h) 'H' else 'V'),
+        });
+        var ni: usize = 0;
+        while (ni < nims.len) : (ni += 1) {
+            const c = nims[ni];
+            if (!c.seen) continue;
+            out_d.line("NIM{d} mode={s} single={d} sats=", .{ ni, @tagName(c.mode), @intFromBool(c.single) });
+            var j: usize = 0;
+            while (j < c.nsat) : (j += 1) {
+                if (c.has_port[j]) {
+                    out_d.line("{d}(port{d}) ", .{ c.positions[j], c.ports[j] });
+                } else {
+                    out_d.line("{d} ", .{c.positions[j]});
+                }
+            }
+            if (c.usesUnicable()) {
+                out_d.line("unicable(slot={d},{d}MHz) ", .{ c.scr_slot, c.scr_freq });
+            } else if (c.unicable) {
+                out_d.line("unicable-cfg-ignored(mode!=advanced) ", .{});
+            }
+            const eff = effectiveNim(&nims, ni, target_pos);
+            if (eff) |cfg| {
+                if (cfg.portFor(target_pos)) |pt| {
+                    out_d.line("=> WOULD USE, DiSEqC committed port {d}\n", .{pt});
+                } else {
+                    out_d.line("=> WOULD USE, no switch command\n", .{});
+                }
+            } else {
+                out_d.line("=> cannot reach target\n", .{});
+            }
+        }
+        return;
+    }
+
     // Auto-selection: successive frontends; NIM config from settings; busy (EBUSY)
     // or no LOCK -> next one. --frontend pins a specific tuner.
     var pathbuf: [64]u8 = undefined;
@@ -990,7 +1041,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var diseqc_port: ?u8 = cli_port;
         if (have_settings) {
             if (effectiveNim(&nims, f, target_pos)) |cfg| {
-                if (cli_scr == null and cfg.unicable and cfg.scr_freq != 0) {
+                if (cli_scr == null and cfg.usesUnicable()) {
                     scr = Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
                 }
                 if (cli_port == null) diseqc_port = cfg.portFor(target_pos);
@@ -1056,7 +1107,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         out_sa.line("# scan-all pos={d} tps={d} frontend={d}\n", .{ sat_pos, queue.len, chosen_fe });
         const scr_used: ?Scr = if (cli_scr != null) cli_scr else if (have_settings) blk: {
             if (effectiveNim(&nims, chosen_fe, target_pos)) |cfg| {
-                if (cfg.unicable and cfg.scr_freq != 0) break :blk Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
+                if (cfg.usesUnicable()) break :blk Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
             }
             break :blk null;
         } else null;
