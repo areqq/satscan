@@ -17,6 +17,23 @@ Supported providers (`--provider`):
 | `nova` | Nova (GR) | BAT 0x0001, descriptor 0x93 |
 | `vivacom` | Vivacom (BG) | BAT 0x6158, descriptor 0xE2 |
 
+Astra 19.2E (`--pos 192`, needs a dish/DiSEqC port for that position) —
+**implemented, not yet verified on air**:
+
+| key | platform | LCN source |
+|---|---|---|
+| `tntsat` | TNTSAT (FR) | BAT 0xC00F, descriptor 0x83 |
+| `movistar` | Movistar+ (ES) | BAT 0x0021, descriptor 0x83 |
+| `simplitv` | simpliTV (AT) | BAT 0x3700, descriptor 0x83 |
+| `canaldigitaal` | Canal Digitaal (NL) | NIT pid 0x385, private table 0xBC |
+| `tvvlaanderen` | TV Vlaanderen (BE) | NIT pid 0x38F, private table 0xBC |
+| `telesat` | TeleSAT (BE) | NIT pid 0x399, private table 0xBC |
+| `austriasat` | Austriasat (AT) | NIT pid 0x3B6, private table 0xBC |
+| `diveo` | Diveo (DE) | NIT pid 0x3C0, private table 0xBC |
+
+The five M7 platforms share one home transponder (12515 H) and differ only by
+the private NIT pid their line-up lives on.
+
 *Dokumentacja po polsku: [README.pl.md](README.pl.md)*
 
 ## Usage
@@ -34,9 +51,11 @@ default 4), `--max-tp N` (limit, for quick tests), `--satxml PATH`.
 
 That is usually all — the tool configures itself:
 
-- reads `/etc/enigma2/settings`, skips NIMs not configured for 13.0E,
-  recognises **Unicable/SCR (EN50494)** and plain universal LNB setups
-  (voltage + 22 kHz tone, no DiSEqC),
+- reads `/etc/enigma2/settings`, skips NIMs that cannot reach the target
+  orbital position, recognises **Unicable/SCR (EN50494)**, plain universal LNB
+  (voltage + 22 kHz tone) and **committed DiSEqC switches** — the port comes
+  from `diseqcA..D` (simple mode) or `advanced.sat.<pos>.commitedDiseqcCommand`
+  (advanced), so multi-satellite dishes work without extra flags,
 - tries successive frontends until one both opens (busy tuners return
   `EBUSY` and are skipped) and achieves **LOCK**,
 - keeps scanning until the bouquet table is **complete**
@@ -50,6 +69,7 @@ Options:
 | `--adapter N` / `--frontend N` / `--demux N` | pin specific devices (default: auto) |
 | `--settings PATH` | enigma settings path (default `/etc/enigma2/settings`) |
 | `--scr-slot N --scr-freq MHz` | force Unicable EN50494 (overrides settings) |
+| `--diseqc-port N` | force committed DiSEqC port 0–3 (overrides settings) |
 | `--lnb-lo/hi/sw kHz` | universal LNB parameters (defaults 9750/10600/11700 MHz) |
 | `--secs S` | LOCK wait per tuner (default 8) |
 | `--scan-secs S` | base scan time (default 25; extends up to 4× until BAT completes) |

@@ -16,6 +16,23 @@ Obsługiwani providerzy (`--provider`):
 | `nova` | Nova (GR) | BAT 0x0001, deskryptor 0x93 |
 | `vivacom` | Vivacom (BG) | BAT 0x6158, deskryptor 0xE2 |
 
+Astra 19.2E (`--pos 192`, wymaga anteny/portu DiSEqC na tę pozycję) —
+**zaimplementowane, jeszcze nieprzetestowane na sygnale**:
+
+| klucz | platforma | źródło LCN |
+|---|---|---|
+| `tntsat` | TNTSAT (FR) | BAT 0xC00F, deskryptor 0x83 |
+| `movistar` | Movistar+ (ES) | BAT 0x0021, deskryptor 0x83 |
+| `simplitv` | simpliTV (AT) | BAT 0x3700, deskryptor 0x83 |
+| `canaldigitaal` | Canal Digitaal (NL) | NIT pid 0x385, prywatna tablica 0xBC |
+| `tvvlaanderen` | TV Vlaanderen (BE) | NIT pid 0x38F, prywatna tablica 0xBC |
+| `telesat` | TeleSAT (BE) | NIT pid 0x399, prywatna tablica 0xBC |
+| `austriasat` | Austriasat (AT) | NIT pid 0x3B6, prywatna tablica 0xBC |
+| `diveo` | Diveo (DE) | NIT pid 0x3C0, prywatna tablica 0xBC |
+
+Pięć platform M7 dzieli jeden transponder domowy (12515 H) i różni się wyłącznie
+prywatnym PID-em NIT, na którym siedzi ich ramówka.
+
 *English documentation: [README.md](README.md)*
 
 ## Użycie
@@ -33,9 +50,11 @@ na żywo o transpondery odkryte w NIT i zbiera SDT actual z każdego
 
 Zwykle to wszystko — narzędzie konfiguruje się samo:
 
-- czyta `/etc/enigma2/settings`, pomija NIM-y nieskonfigurowane na 13.0E,
-  rozpoznaje **Unicable/SCR (EN50494)** oraz zwykły uniwersalny LNB
-  (napięcie + ton 22 kHz, bez DiSEqC),
+- czyta `/etc/enigma2/settings`, pomija NIM-y niesięgające docelowej pozycji
+  orbitalnej, rozpoznaje **Unicable/SCR (EN50494)**, zwykły uniwersalny LNB
+  (napięcie + ton 22 kHz) oraz **przełączniki committed DiSEqC** — port bierze
+  z `diseqcA..D` (tryb prosty) albo `advanced.sat.<pos>.commitedDiseqcCommand`
+  (zaawansowany), więc anteny wielosatelitarne działają bez dodatkowych flag,
 - próbuje kolejnych frontendów, aż któryś się otworzy (zajęte tunery zwracają
   `EBUSY` i są pomijane) **i** złapie LOCK,
 - skanuje aż tablica bukietu będzie **kompletna** (śledzenie sekcji BAT),
@@ -49,6 +68,7 @@ Opcje:
 | `--adapter N` / `--frontend N` / `--demux N` | przypięcie konkretnych urządzeń (domyślnie: auto) |
 | `--settings ŚCIEŻKA` | ustawienia enigmy (domyślnie `/etc/enigma2/settings`) |
 | `--scr-slot N --scr-freq MHz` | wymuszenie Unicable EN50494 (nadpisuje settings) |
+| `--diseqc-port N` | wymuszenie portu committed DiSEqC 0–3 (nadpisuje settings) |
 | `--lnb-lo/hi/sw kHz` | parametry uniwersalnego LNB (domyślnie 9750/10600/11700 MHz) |
 | `--secs S` | czekanie na LOCK per tuner (domyślnie 8) |
 | `--scan-secs S` | bazowy czas skanu (domyślnie 25; wydłuża się do 4× aż BAT będzie kompletny) |

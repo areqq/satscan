@@ -224,9 +224,13 @@ const Provider = struct {
     mod: u32,
     onid: u16,
     tsid: u16,
+    pos: u32 = 130, // orbital position (130 = 13.0E, 192 = 19.2E)
     bat_bouquet_id: u16 = 0, // 0 = no BAT scan
     bat_lcn_desc: u8 = 0, // LCN descriptor in BAT (Canal+: 0x83)
+    bat_pid: u16 = 0x11, // DVB default; some platforms use a private PID
     nit_lcn_desc: u8 = 0, // LCN descriptor in NIT (Polsat: 0x82)
+    nit_pid: u16 = 0x10, // DVB default; M7 platforms use a private PID
+    nit_table_id: u8 = 0x40, // DVB default; M7 uses private table 0xBC
     nit_other: bool = false, // also read NIT-other 0x41 (Tivusat keeps LCN there)
 };
 
@@ -239,6 +243,19 @@ const PROVIDERS = [_]Provider{
     .{ .key = "skyitalia", .name = "Sky Italia", .freq = 11881000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS, .mod = QPSK, .onid = 64511, .tsid = 5800, .bat_bouquet_id = 0x6250, .bat_lcn_desc = 0xb1 },
     .{ .key = "tivusat", .name = "Tivusat", .freq = 10992000, .sr = 27500000, .pol_h = false, .fec = FEC_2_3, .sys = SYS_DVBS, .mod = QPSK, .onid = 318, .tsid = 12400, .nit_lcn_desc = 0x83, .nit_other = true },
     .{ .key = "vivacom", .name = "Vivacom", .freq = 12713000, .sr = 30000000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 213, .tsid = 10000, .bat_bouquet_id = 0x6158, .bat_lcn_desc = 0xe2 },
+
+    // --- Astra 19.2E ---------------------------------------------------------
+    // M7 group: one shared home transponder, each platform has its own private
+    // NIT pid and uses private table id 0xBC (LCN descriptor 0x83).
+    .{ .key = "canaldigitaal", .name = "Canal Digitaal", .freq = 12515000, .sr = 22000000, .pol_h = true, .fec = FEC_5_6, .sys = SYS_DVBS, .mod = QPSK, .onid = 0x0035, .tsid = 0x0451, .pos = 192, .nit_lcn_desc = 0x83, .nit_pid = 0x385, .nit_table_id = 0xbc },
+    .{ .key = "tvvlaanderen", .name = "TV Vlaanderen", .freq = 12515000, .sr = 22000000, .pol_h = true, .fec = FEC_5_6, .sys = SYS_DVBS, .mod = QPSK, .onid = 0x0035, .tsid = 0x0451, .pos = 192, .nit_lcn_desc = 0x83, .nit_pid = 0x38f, .nit_table_id = 0xbc },
+    .{ .key = "telesat", .name = "TeleSAT", .freq = 12515000, .sr = 22000000, .pol_h = true, .fec = FEC_5_6, .sys = SYS_DVBS, .mod = QPSK, .onid = 0x0035, .tsid = 0x0451, .pos = 192, .nit_lcn_desc = 0x83, .nit_pid = 0x399, .nit_table_id = 0xbc },
+    .{ .key = "austriasat", .name = "Austriasat", .freq = 12515000, .sr = 22000000, .pol_h = true, .fec = FEC_5_6, .sys = SYS_DVBS, .mod = QPSK, .onid = 0x0035, .tsid = 0x0451, .pos = 192, .nit_lcn_desc = 0x83, .nit_pid = 0x3b6, .nit_table_id = 0xbc },
+    .{ .key = "diveo", .name = "Diveo", .freq = 12515000, .sr = 22000000, .pol_h = true, .fec = FEC_5_6, .sys = SYS_DVBS, .mod = QPSK, .onid = 0x0035, .tsid = 0x0451, .pos = 192, .nit_lcn_desc = 0x83, .nit_pid = 0x3c0, .nit_table_id = 0xbc },
+    // Standalone 19.2E platforms (LCN in BAT, default descriptor 0x83)
+    .{ .key = "tntsat", .name = "TNTSAT (French TNT)", .freq = 11856000, .sr = 29700000, .pol_h = false, .fec = FEC_2_3, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 1, .tsid = 1072, .pos = 192, .bat_bouquet_id = 0xc00f, .bat_lcn_desc = 0x83 },
+    .{ .key = "movistar", .name = "Movistar+", .freq = 10758500, .sr = 22000000, .pol_h = false, .fec = FEC_2_3, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 1, .tsid = 1052, .pos = 192, .bat_bouquet_id = 0x0021, .bat_lcn_desc = 0x83 },
+    .{ .key = "simplitv", .name = "simpliTV", .freq = 11273000, .sr = 22000000, .pol_h = true, .fec = FEC_2_3, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 1, .tsid = 1005, .pos = 192, .bat_bouquet_id = 0x3700, .bat_lcn_desc = 0x83 },
 };
 
 // ---------- I/O on raw syscalls (no libc) ----------
@@ -279,7 +296,7 @@ fn ioctlChecked(fd: i32, request: u32, arg: usize, what: []const u8) !void {
 const Lnb = struct { lo: u32 = 9750000, hi: u32 = 10600000, sw: u32 = 11700000 };
 const Scr = struct { slot: u8, freq_mhz: u32 }; // Unicable EN50494 user band
 
-fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr) !void {
+fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8) !void {
     const high = p.freq >= lnb.sw;
     var ifreq: u32 = if (high) p.freq - lnb.hi else p.freq - lnb.lo;
 
@@ -287,9 +304,11 @@ fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr) !void {
         // Unicable EN50494: SCR command sent at 18V, reception on the slot IF
         const tp_if_mhz = ifreq / 1000;
         const t: u32 = (tp_if_mhz + u.freq_mhz + 2) / 4 - 350;
+        // bit 4 selects the satellite position bank (committed port 0/1)
+        const bank: u8 = if (diseqc_port) |pt| (pt & 1) else 0;
         var cmd = dvb_diseqc_master_cmd{ .msg = .{
             0xE0, 0x10, 0x5A,
-            (@as(u8, u.slot & 0x07) << 5) | (@as(u8, @intFromBool(p.pol_h)) << 3) | (@as(u8, @intFromBool(high)) << 2) | @as(u8, @intCast((t >> 8) & 0x03)),
+            (@as(u8, u.slot & 0x07) << 5) | (bank << 4) | (@as(u8, @intFromBool(p.pol_h)) << 3) | (@as(u8, @intFromBool(high)) << 2) | @as(u8, @intCast((t >> 8) & 0x03)),
             @intCast(t & 0xff),
             0,
         }, .msg_len = 5 };
@@ -303,9 +322,23 @@ fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr) !void {
         try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_13, "FE_SET_VOLTAGE(13)");
         ifreq = u.freq_mhz * 1000; // receive on the user-band IF
     } else {
-        // tone/voltage by band and polarisation (universal LNB, no DiSEqC)
         const voltage: u32 = if (p.pol_h) SEC_VOLTAGE_18 else SEC_VOLTAGE_13;
         const tone: u32 = if (high) SEC_TONE_ON else SEC_TONE_OFF;
+        if (diseqc_port) |port| {
+            // committed switch (2/4-way, also monoblocks): tone off, 18V for a
+            // reliable command, then E0 10 38 <F0|port<<2|pol<<1|band>
+            try ioctlChecked(fd, FE_SET_TONE, SEC_TONE_OFF, "FE_SET_TONE");
+            try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_18, "FE_SET_VOLTAGE(18)");
+            sleepMs(15);
+            var cmd = dvb_diseqc_master_cmd{ .msg = .{
+                0xE0, 0x10, 0x38,
+                0xF0 | (@as(u8, port & 0x03) << 2) | (@as(u8, @intFromBool(p.pol_h)) << 1) | @as(u8, @intFromBool(high)),
+                0, 0,
+            }, .msg_len = 4 };
+            try ioctlChecked(fd, FE_DISEQC_SEND_MASTER_CMD, @intFromPtr(&cmd), "FE_DISEQC_SEND_MASTER_CMD");
+            sleepMs(54); // spec: >=15ms, switches like a bit more
+        }
+        // tone/voltage by band and polarisation (universal LNB)
         try ioctlChecked(fd, FE_SET_VOLTAGE, voltage, "FE_SET_VOLTAGE");
         try ioctlChecked(fd, FE_SET_TONE, tone, "FE_SET_TONE");
     }
@@ -576,23 +609,76 @@ fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc
 
 // ---------- tuner configuration from /etc/enigma2/settings ----------
 const NimMode = enum { unknown, simple, advanced, nothing, equal, loopthrough, satposdepends };
+const MAX_SATS = 8;
+
+// One tuner's dish setup: which orbital positions it can reach and, for each,
+// which committed DiSEqC port selects it (null = no switch, single LNB).
 const NimCfg = struct {
     seen: bool = false,
     mode: NimMode = .unknown,
-    diseqc130: bool = false, // simple mode: diseqcA=130
-    adv130: bool = false, // advanced mode: sat.130 configured
+    single: bool = false, // diseqcMode=single -> never send a switch command
+    positions: [MAX_SATS]u32 = [_]u32{0} ** MAX_SATS,
+    ports: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS,
+    has_port: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
+    nsat: usize = 0,
     unicable: bool = false,
     scr_slot: u8 = 0,
     scr_freq: u32 = 0,
 
-    fn eligible13e(self: NimCfg) bool {
-        return switch (self.mode) {
-            .nothing => false,
-            .advanced => self.adv130,
-            else => self.diseqc130 or self.adv130,
-        };
+    fn addSat(self: *NimCfg, pos: u32, port: ?u8) void {
+        var i: usize = 0;
+        while (i < self.nsat) : (i += 1) {
+            if (self.positions[i] == pos) {
+                if (port) |pt| {
+                    self.ports[i] = pt;
+                    self.has_port[i] = true;
+                }
+                return;
+            }
+        }
+        if (self.nsat >= MAX_SATS) return;
+        self.positions[self.nsat] = pos;
+        if (port) |pt| {
+            self.ports[self.nsat] = pt;
+            self.has_port[self.nsat] = true;
+        }
+        self.nsat += 1;
+    }
+
+    fn handles(self: NimCfg, pos: u32) bool {
+        if (self.mode == .nothing) return false;
+        for (self.positions[0..self.nsat]) |p| {
+            if (p == pos) return true;
+        }
+        return false;
+    }
+
+    // committed DiSEqC port for this position, or null when no switch is used
+    fn portFor(self: NimCfg, pos: u32) ?u8 {
+        if (self.single) return null;
+        var i: usize = 0;
+        while (i < self.nsat) : (i += 1) {
+            if (self.positions[i] == pos and self.has_port[i]) return self.ports[i];
+        }
+        return null;
     }
 };
+
+// enigma stores committed commands as AA/AB/BA/BB (port 0..3)
+fn parseCommitted(v: []const u8) ?u8 {
+    if (v.len < 2) return null;
+    const hi: u8 = switch (v[0]) {
+        'A' => 0,
+        'B' => 2,
+        else => return null,
+    };
+    const lo: u8 = switch (v[1]) {
+        'A' => 0,
+        'B' => 1,
+        else => return null,
+    };
+    return hi + lo;
+}
 
 fn valueAfterEq(kv: []const u8) []const u8 {
     const eq = std.mem.lastIndexOfScalar(u8, kv, '=') orelse return "";
@@ -632,10 +718,29 @@ fn parseSettings(path: [*:0]const u8, nims: []NimCfg) bool {
             else if (std.mem.eql(u8, v, "loopthrough")) .loopthrough
             else if (std.mem.eql(u8, v, "satposdepends")) .satposdepends
             else .unknown;
-        } else if (std.mem.eql(u8, kv, "diseqcA=130")) {
-            c.diseqc130 = true;
-        } else if (std.mem.startsWith(u8, kv, "advanced.sat.130.")) {
-            c.adv130 = true;
+        } else if (std.mem.startsWith(u8, kv, "diseqc") and kv.len > 7 and kv[7] == '=') {
+            // simple mode: diseqcA..D = orbital position on committed port 0..3
+            const port: u8 = switch (kv[6]) {
+                'A' => 0,
+                'B' => 1,
+                'C' => 2,
+                'D' => 3,
+                else => continue,
+            };
+            if (std.fmt.parseInt(u32, valueAfterEq(kv), 10) catch null) |pos| c.addSat(pos, port);
+        } else if (std.mem.eql(u8, kv, "diseqcMode=single")) {
+            c.single = true;
+        } else if (std.mem.startsWith(u8, kv, "advanced.sat.")) {
+            // advanced mode: advanced.sat.<pos>.<key>=<value>
+            const rest2 = kv["advanced.sat.".len..];
+            const dot2 = std.mem.indexOfScalar(u8, rest2, '.') orelse continue;
+            const pos = std.fmt.parseInt(u32, rest2[0..dot2], 10) catch continue;
+            const sub = rest2[dot2 + 1 ..];
+            if (std.mem.startsWith(u8, sub, "commitedDiseqcCommand=") or std.mem.startsWith(u8, sub, "committedDiseqcCommand=")) {
+                c.addSat(pos, parseCommitted(valueAfterEq(sub)));
+            } else {
+                c.addSat(pos, null);
+            }
         } else if (std.mem.indexOf(u8, kv, ".lof=unicable") != null) {
             c.unicable = true;
         } else if (std.mem.indexOf(u8, kv, ".scrfrequency=") != null) {
@@ -649,26 +754,26 @@ fn parseSettings(path: [*:0]const u8, nims: []NimCfg) bool {
 }
 
 // equal/loopthrough/satposdepends inherit the first fully configured NIM
-fn effectiveNim(nims: []const NimCfg, idx: usize) ?NimCfg {
+fn effectiveNim(nims: []const NimCfg, idx: usize, pos: u32) ?NimCfg {
     if (idx >= nims.len) return null;
     const c = nims[idx];
     switch (c.mode) {
         .nothing => return null,
         .equal, .loopthrough, .satposdepends => {
             for (nims) |donor| {
-                if (donor.eligible13e() and donor.mode != .equal and donor.mode != .loopthrough and donor.mode != .satposdepends) return donor;
+                if (donor.handles(pos) and donor.mode != .equal and donor.mode != .loopthrough and donor.mode != .satposdepends) return donor;
             }
             return null;
         },
-        else => return if (c.eligible13e()) c else null,
+        else => return if (c.handles(pos)) c else null,
     }
 }
 
 // Full-satellite scan: walk every transponder from the queue (seeded from
 // satellites.xml, extended live with NIT discoveries), grab SDT actual + NIT
 // on each, emit T/S lines. LCN is provider-specific, so none here.
-fn scanAll(fe: i32, fe_num: u32, dmx_path: [*:0]const u8, lnb: Lnb, scr: ?Scr, queue: *TpQueue,
-           lock_secs: u32, tp_secs: u32, max_tp: usize, pos_label: u32,
+fn scanAll(fe: i32, fe_num: u32, dmx_path: [*:0]const u8, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8,
+           queue: *TpQueue, lock_secs: u32, tp_secs: u32, max_tp: usize, pos_label: u32,
            out: *Out, alloc: std.mem.Allocator) !void {
     var seen = std.AutoHashMap(u32, void).init(alloc);
     defer seen.deinit();
@@ -684,8 +789,8 @@ fn scanAll(fe: i32, fe_num: u32, dmx_path: [*:0]const u8, lnb: Lnb, scr: ?Scr, q
         if (max_tp != 0 and tried >= max_tp) break;
         tried += 1;
         const tp = queue.items[i];
-        const prov = Provider{ .key = "", .name = "", .freq = tp.freq, .sr = tp.sr, .pol_h = tp.pol == 0, .fec = tp.fec, .sys = tp.sys, .mod = tp.mod, .onid = 0, .tsid = 0 };
-        tune(fe, prov, lnb, scr) catch {
+        const prov = Provider{ .key = "", .name = "", .freq = tp.freq, .sr = tp.sr, .pol_h = tp.pol == 0, .fec = tp.fec, .sys = tp.sys, .mod = tp.mod, .onid = 0, .tsid = 0, .pos = pos_label };
+        tune(fe, prov, lnb, scr, diseqc_port) catch {
             out.line("# tp {d}{c} sr={d} lock=err\n", .{ tp.freq, POLCHARS[tp.pol], tp.sr });
             continue;
         };
@@ -777,6 +882,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var scr_slot: ?u8 = null;
     var scr_freq: u32 = 0;
     var settings_path: [:0]const u8 = "/etc/enigma2/settings";
+    var cli_port: ?u8 = null;
     var scan_all = false;
     var satxml_path: [:0]const u8 = "/etc/tuxbox/satellites.xml";
     var sat_pos: u32 = 130;
@@ -810,6 +916,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             scr_freq = try std.fmt.parseInt(u32, it.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--settings")) {
             settings_path = it.next() orelse return error.MissingArg;
+        } else if (std.mem.eql(u8, a, "--diseqc-port")) {
+            cli_port = try std.fmt.parseInt(u8, it.next() orelse return error.MissingArg, 10);
         } else if (std.mem.eql(u8, a, "--scan-all")) {
             scan_all = true;
         } else if (std.mem.eql(u8, a, "--satxml")) {
@@ -852,7 +960,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         p_eff.mod = first.mod;
     }
 
-    // Tuner configuration from enigma settings (unicable, 13E assignment).
+    // Target orbital position: provider's home sat, or --pos for a full scan.
+    const target_pos: u32 = if (scan_all) sat_pos else p.pos;
+
+    // Tuner configuration from enigma settings (unicable, dish/DiSEqC layout).
     var nims = [_]NimCfg{.{}} ** 16;
     const have_settings = parseSettings(settings_path, &nims);
     if (!have_settings) std.debug.print("[satscan] no {s} - trying every tuner with a plain LNB\n", .{settings_path});
@@ -870,20 +981,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var pathbuf: [64]u8 = undefined;
     var fe: i32 = -1;
     var chosen_fe: u32 = 0;
+    var chosen_port: ?u8 = null;
     var locked = false;
     var f: u32 = if (fe_index) |fi| fi else 0;
     const f_end: u32 = if (fe_index) |fi| fi + 1 else 16;
     while (f < f_end) : (f += 1) {
         var scr: ?Scr = cli_scr;
+        var diseqc_port: ?u8 = cli_port;
         if (have_settings) {
-            if (effectiveNim(&nims, f)) |cfg| {
+            if (effectiveNim(&nims, f, target_pos)) |cfg| {
                 if (cli_scr == null and cfg.unicable and cfg.scr_freq != 0) {
                     scr = Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
                 }
+                if (cli_port == null) diseqc_port = cfg.portFor(target_pos);
             } else if (fe_index == null) {
-                continue; // NIM not configured for 13E - skipped in auto mode
+                continue; // this NIM cannot reach the target position - skip
             } else {
-                std.debug.print("[satscan] frontend{d}: NIM not configured for 13E - trying anyway\n", .{f});
+                std.debug.print("[satscan] frontend{d}: NIM not configured for {d}.{d}E - trying anyway\n", .{ f, target_pos / 10, target_pos % 10 });
             }
         }
         const fe_path = try std.fmt.bufPrintZ(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ adapter, f });
@@ -895,28 +1009,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
             continue;
         };
         if (scr) |u| {
-            std.debug.print("[satscan] frontend{d}: unicable slot={d} freq={d}MHz\n", .{ f, u.slot, u.freq_mhz });
+            std.debug.print("[satscan] frontend{d}: unicable slot={d} freq={d}MHz{s}\n", .{ f, u.slot, u.freq_mhz, if (diseqc_port != null) " (+bank)" else "" });
+        } else if (diseqc_port) |pt| {
+            std.debug.print("[satscan] frontend{d}: plain LNB, DiSEqC committed port {d}\n", .{ f, pt });
         } else {
             std.debug.print("[satscan] frontend{d}: plain LNB\n", .{f});
         }
         if (scan_all) { // scan-all: first configured tuner that opens; locks counted per tp
             fe = fd;
             chosen_fe = f;
+            chosen_port = diseqc_port;
             locked = true;
             break;
         }
-        tune(fd, p_eff, lnb, scr) catch {
+        tune(fd, p_eff, lnb, scr, diseqc_port) catch {
             _ = linux.close(fd);
             continue;
         };
         var ok = waitLock(fd, secs);
         if (!ok and scr != null) { // unicable can be moody - one retry
-            tune(fd, p_eff, lnb, scr) catch {};
+            tune(fd, p_eff, lnb, scr, diseqc_port) catch {};
             ok = waitLock(fd, secs);
         }
         if (ok) {
             fe = fd;
             chosen_fe = f;
+            chosen_port = diseqc_port;
             locked = true;
             break;
         }
@@ -924,7 +1042,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         _ = linux.close(fd);
     }
     if (fe < 0) {
-        std.debug.print("[satscan] no tuner achieved LOCK on 13E\n", .{});
+        std.debug.print("[satscan] no tuner achieved LOCK on {d}.{d}E\n", .{ target_pos / 10, target_pos % 10 });
         return error.NoLock;
     }
     defer _ = linux.close(fe);
@@ -937,12 +1055,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var out_sa = Out{};
         out_sa.line("# scan-all pos={d} tps={d} frontend={d}\n", .{ sat_pos, queue.len, chosen_fe });
         const scr_used: ?Scr = if (cli_scr != null) cli_scr else if (have_settings) blk: {
-            if (effectiveNim(&nims, chosen_fe)) |cfg| {
+            if (effectiveNim(&nims, chosen_fe, target_pos)) |cfg| {
                 if (cfg.unicable and cfg.scr_freq != 0) break :blk Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
             }
             break :blk null;
         } else null;
-        try scanAll(fe, chosen_fe, dmx_path0, lnb, scr_used, &queue, secs, tp_secs, max_tp, sat_pos, &out_sa, alloc);
+        try scanAll(fe, chosen_fe, dmx_path0, lnb, scr_used, chosen_port, &queue, secs, tp_secs, max_tp, sat_pos, &out_sa, alloc);
         return;
     }
 
@@ -959,12 +1077,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const fd_nit = demuxOpenFor(dmx_path, chosen_fe) orelse return error.DemuxOpen;
     defer _ = linux.close(fd_nit);
-    try setSectionFilter(fd_nit, 0x10, 0x40, if (p.nit_other) 0xfe else 0xff, null); // NIT actual (+other)
+    // NIT: DVB default 0x10/0x40, or the platform's private pid/table (M7: 0xBC)
+    try setSectionFilter(fd_nit, p.nit_pid, p.nit_table_id, if (p.nit_other) 0xfe else 0xff, null);
 
     var fd_bat: i32 = -1;
     if (p.bat_bouquet_id != 0) {
         fd_bat = demuxOpenFor(dmx_path, chosen_fe) orelse return error.DemuxOpen;
-        try setSectionFilter(fd_bat, 0x11, 0x4a, 0xff, p.bat_bouquet_id); // BAT of our bouquet
+        try setSectionFilter(fd_bat, p.bat_pid, 0x4a, 0xff, p.bat_bouquet_id); // BAT of our bouquet
     }
     defer if (fd_bat >= 0) {
         _ = linux.close(fd_bat);
@@ -1029,7 +1148,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (fds_buf[fi].fd == fd_sdt) {
                 parseSdt(sec, &ids, &out, &seen);
             } else if (fds_buf[fi].fd == fd_nit) {
-                if (sec[0] == 0x40 or (p.nit_other and sec[0] == 0x41)) {
+                if (sec[0] == p.nit_table_id or (p.nit_other and sec[0] == p.nit_table_id + 1)) {
                     parseNitLike(sec, sec[0], null, p.nit_lcn_desc, "nit", &out, &seen_tp, &seen_lcn, null);
                 }
             } else {
