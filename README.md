@@ -55,7 +55,9 @@ That is usually all — the tool configures itself:
   orbital position, recognises **Unicable/SCR (EN50494)**, plain universal LNB
   (voltage + 22 kHz tone) and **committed DiSEqC switches** — the port comes
   from `diseqcA..D` (simple mode) or `advanced.sat.<pos>.commitedDiseqcCommand`
-  (advanced), so multi-satellite dishes work without extra flags,
+  (advanced), so multi-satellite dishes work without extra flags; the committed
+  command is followed by the mini-DiSEqC tone burst (A/B) that enigma also sends,
+  for switches that only react to the burst,
 - tries successive frontends until one both opens (busy tuners return
   `EBUSY` and are skipped) and achieves **LOCK**,
 - keeps scanning until the bouquet table is **complete**

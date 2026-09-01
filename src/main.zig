@@ -82,6 +82,7 @@ const FE_DISEQC_SEND_MASTER_CMD = IOCTL.IOW('o', 63, dvb_diseqc_master_cmd);
 const FE_SET_PROPERTY = IOCTL.IOW('o', 82, dtv_properties);
 const FE_READ_STATUS = IOCTL.IOR('o', 69, u32);
 const FE_SET_VOLTAGE = IOCTL.IO('o', 67);
+const FE_DISEQC_SEND_BURST = IOCTL.IO('o', 65); // fe_sec_mini_cmd: 0=A, 1=B
 const FE_SET_TONE = IOCTL.IO('o', 66);
 
 // ---------- DVB demux ----------
@@ -339,6 +340,11 @@ fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8) !void {
             }, .msg_len = 4 };
             try ioctlChecked(fd, FE_DISEQC_SEND_MASTER_CMD, @intFromPtr(&cmd), "FE_DISEQC_SEND_MASTER_CMD");
             sleepMs(54); // spec: >=15ms, switches like a bit more
+            // Many 2-way switches (and the a/b mode enigma uses) only react to
+            // the mini-DiSEqC tone burst, so send it as well: A for even ports,
+            // B for odd ones.
+            try ioctlChecked(fd, FE_DISEQC_SEND_BURST, @as(usize, port & 1), "FE_DISEQC_SEND_BURST");
+            sleepMs(30);
         }
         // tone/voltage by band and polarisation (universal LNB)
         try ioctlChecked(fd, FE_SET_VOLTAGE, voltage, "FE_SET_VOLTAGE");

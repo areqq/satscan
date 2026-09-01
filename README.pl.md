@@ -54,7 +54,9 @@ Zwykle to wszystko — narzędzie konfiguruje się samo:
   orbitalnej, rozpoznaje **Unicable/SCR (EN50494)**, zwykły uniwersalny LNB
   (napięcie + ton 22 kHz) oraz **przełączniki committed DiSEqC** — port bierze
   z `diseqcA..D` (tryb prosty) albo `advanced.sat.<pos>.commitedDiseqcCommand`
-  (zaawansowany), więc anteny wielosatelitarne działają bez dodatkowych flag,
+  (zaawansowany), więc anteny wielosatelitarne działają bez dodatkowych flag; po
+  komendzie committed idzie jeszcze mini-DiSEqC tone burst (A/B), który wysyła też
+  enigma — dla przełączników reagujących wyłącznie na burst,
 - próbuje kolejnych frontendów, aż któryś się otworzy (zajęte tunery zwracają
   `EBUSY` i są pomijane) **i** złapie LOCK,
 - skanuje aż tablica bukietu będzie **kompletna** (śledzenie sekcji BAT),
