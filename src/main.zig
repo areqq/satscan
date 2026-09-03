@@ -646,6 +646,7 @@ const NimCfg = struct {
     seen: bool = false,
     mode: NimMode = .unknown,
     single: bool = false, // diseqcMode=single -> never send a switch command
+    ab_only: bool = false, // diseqcMode=toneburst_a_b / diseqc_a_b -> only ports 0 and 1 exist
     positions: [MAX_SATS]u32 = [_]u32{0} ** MAX_SATS,
     ports: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS,
     has_port: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
@@ -664,9 +665,14 @@ const NimCfg = struct {
         var i: usize = 0;
         while (i < self.nsat) : (i += 1) {
             if (self.positions[i] == pos) {
+                // First assignment wins: images keep stale duplicates (e.g.
+                // diseqcA=130 alongside diseqcD=130), and letting the later one
+                // through would move 13E onto port 3.
                 if (port) |pt| {
-                    self.ports[i] = pt;
-                    self.has_port[i] = true;
+                    if (!self.has_port[i]) {
+                        self.ports[i] = pt;
+                        self.has_port[i] = true;
+                    }
                 }
                 return;
             }
@@ -680,10 +686,19 @@ const NimCfg = struct {
         self.nsat += 1;
     }
 
+    // An A/B switch only has ports 0 and 1; diseqcC/D are stale leftovers there.
+    fn portUsable(self: NimCfg, i: usize) bool {
+        return self.has_port[i] and !(self.ab_only and self.ports[i] > 1);
+    }
+
     fn handles(self: NimCfg, pos: u32) bool {
         if (self.mode == .nothing) return false;
-        for (self.positions[0..self.nsat]) |p| {
-            if (p == pos) return true;
+        var i: usize = 0;
+        while (i < self.nsat) : (i += 1) {
+            if (self.positions[i] != pos) continue;
+            // in A/B mode a position only reachable through port C/D is not reachable
+            if (self.ab_only and self.has_port[i] and self.ports[i] > 1) return false;
+            return true;
         }
         return false;
     }
@@ -693,7 +708,7 @@ const NimCfg = struct {
         if (self.single) return null;
         var i: usize = 0;
         while (i < self.nsat) : (i += 1) {
-            if (self.positions[i] == pos and self.has_port[i]) return self.ports[i];
+            if (self.positions[i] == pos and self.portUsable(i)) return self.ports[i];
         }
         return null;
     }
@@ -765,8 +780,13 @@ fn parseSettings(path: [*:0]const u8, nims: []NimCfg) bool {
                 else => continue,
             };
             if (std.fmt.parseInt(u32, valueAfterEq(kv), 10) catch null) |pos| c.addSat(pos, port);
-        } else if (std.mem.eql(u8, kv, "diseqcMode=single")) {
-            c.single = true;
+        } else if (std.mem.startsWith(u8, kv, "diseqcMode=")) {
+            const v = valueAfterEq(kv);
+            if (std.mem.eql(u8, v, "single")) {
+                c.single = true;
+            } else if (std.mem.eql(u8, v, "toneburst_a_b") or std.mem.eql(u8, v, "diseqc_a_b")) {
+                c.ab_only = true;
+            }
         } else if (std.mem.startsWith(u8, kv, "advanced.sat.")) {
             // advanced mode: advanced.sat.<pos>.<key>=<value>
             const rest2 = kv["advanced.sat.".len..];
@@ -1026,7 +1046,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         while (ni < nims.len) : (ni += 1) {
             const c = nims[ni];
             if (!c.seen) continue;
-            out_d.line("NIM{d} mode={s} single={d} sats=", .{ ni, @tagName(c.mode), @intFromBool(c.single) });
+            out_d.line("NIM{d} mode={s} single={d} ab={d} sats=", .{ ni, @tagName(c.mode), @intFromBool(c.single), @intFromBool(c.ab_only) });
             var j: usize = 0;
             while (j < c.nsat) : (j += 1) {
                 if (c.has_port[j]) {
