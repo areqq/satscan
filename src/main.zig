@@ -216,6 +216,19 @@ fn parseSatellitesXml(path: [*:0]const u8, want_pos: u32, queue: *TpQueue) bool 
 }
 
 // ---------- provider table ----------
+// A network's NIT/BAT rides on several of its transponders, so a home TP that
+// goes weak or gets vacated (e.g. Canal+ 2026 consolidation) should not sink the
+// whole scan: `alts` lists spare entry transponders, tried when the primary
+// won't lock.
+const HomeTp = struct {
+    freq: u32, // kHz
+    sr: u32,
+    pol_h: bool,
+    fec: u32,
+    sys: u32,
+    mod: u32,
+};
+
 const Provider = struct {
     key: []const u8,
     name: []const u8,
@@ -227,6 +240,7 @@ const Provider = struct {
     mod: u32,
     onid: u16,
     tsid: u16,
+    alts: []const HomeTp = &.{}, // spare home transponders, tried if primary won't lock
     pos: u32 = 130, // orbital position (130 = 13.0E, 192 = 19.2E)
     bat_bouquet_id: u16 = 0, // 0 = no BAT scan
     bat_lcn_desc: u8 = 0, // LCN descriptor in BAT (Canal+: 0x83)
@@ -240,7 +254,14 @@ const Provider = struct {
 const FEC_2_3: u32 = 2;
 
 const PROVIDERS = [_]Provider{
-    .{ .key = "canalplus", .name = "Platforma Canal+", .freq = 10719000, .sr = 27500000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 318, .tsid = 11000, .bat_bouquet_id = 0x2020, .bat_lcn_desc = 0x83 },
+    // Canal+ home 10719 V carries the full network NIT + bouquet 0x2020 BAT.
+    // It is FEC 3/4 (the sibling muxes are 5/6) - this demod family will not lock
+    // on the wrong code rate (FEC_AUTO fails on old MIPS tuners), so the value has
+    // to be exact. `alts` gives spare 5/6 entry TPs if 10719 V ever goes dark.
+    .{ .key = "canalplus", .name = "Platforma Canal+", .freq = 10719000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 318, .tsid = 11000, .bat_bouquet_id = 0x2020, .bat_lcn_desc = 0x83, .alts = &.{
+        .{ .freq = 11488000, .sr = 27500000, .pol_h = true, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8 },
+        .{ .freq = 11278000, .sr = 27500000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8 },
+    } },
     .{ .key = "polsat", .name = "Polsat Box", .freq = 12188000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 113, .tsid = 7400, .nit_lcn_desc = 0x82 },
     .{ .key = "nova", .name = "Nova Greece", .freq = 11823000, .sr = 27500000, .pol_h = true, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 318, .tsid = 5500, .bat_bouquet_id = 0x0001, .bat_lcn_desc = 0x93 },
     .{ .key = "skyitalia", .name = "Sky Italia", .freq = 11881000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS, .mod = QPSK, .onid = 64511, .tsid = 5800, .bat_bouquet_id = 0x6250, .bat_lcn_desc = 0xb1 },
@@ -1079,16 +1100,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
             locked = true;
             break;
         }
-        tune(fd, p_eff, lnb, scr, diseqc_port) catch {
-            _ = linux.close(fd);
-            continue;
-        };
-        var ok = waitLock(fd, secs);
-        if (!ok and scr != null) { // unicable can be moody - one retry
-            tune(fd, p_eff, lnb, scr, diseqc_port) catch {};
-            ok = waitLock(fd, secs);
+        // Try the primary home TP, then any spare `alts`, on this frontend.
+        var cands: [8]HomeTp = undefined;
+        cands[0] = .{ .freq = p_eff.freq, .sr = p_eff.sr, .pol_h = p_eff.pol_h, .fec = p_eff.fec, .sys = p_eff.sys, .mod = p_eff.mod };
+        var ncand: usize = 1;
+        for (p.alts) |alt| {
+            if (ncand >= cands.len) break;
+            cands[ncand] = alt;
+            ncand += 1;
         }
-        if (ok) {
+        var cand_locked = false;
+        var ci: usize = 0;
+        while (ci < ncand) : (ci += 1) {
+            var pc = p_eff;
+            pc.freq = cands[ci].freq;
+            pc.sr = cands[ci].sr;
+            pc.pol_h = cands[ci].pol_h;
+            pc.fec = cands[ci].fec;
+            pc.sys = cands[ci].sys;
+            pc.mod = cands[ci].mod;
+            tune(fd, pc, lnb, scr, diseqc_port) catch continue;
+            var ok = waitLock(fd, secs);
+            if (!ok and scr != null) { // unicable can be moody - one retry
+                tune(fd, pc, lnb, scr, diseqc_port) catch {};
+                ok = waitLock(fd, secs);
+            }
+            if (ok) {
+                p_eff = pc; // downstream table reads use the TP that actually locked
+                cand_locked = true;
+                break;
+            }
+        }
+        if (cand_locked) {
             fe = fd;
             chosen_fe = f;
             chosen_port = diseqc_port;
@@ -1122,7 +1165,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     var out = Out{};
-    out.line("# provider={s} freq={d} pol={s} lock={d} frontend={d}\n", .{ p.name, p.freq, if (p.pol_h) "H" else "V", @intFromBool(locked), chosen_fe });
+    out.line("# provider={s} freq={d} pol={s} lock={d} frontend={d}\n", .{ p.name, p_eff.freq, if (p_eff.pol_h) "H" else "V", @intFromBool(locked), chosen_fe });
 
     var dmxbuf: [64]u8 = undefined;
     const dmx_path = try std.fmt.bufPrintZ(&dmxbuf, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, demux });
