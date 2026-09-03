@@ -1081,6 +1081,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var chosen_fe: u32 = 0;
     var chosen_port: ?u8 = null;
     var locked = false;
+    var tuners_tried: usize = 0; // frontends we actually tuned
+    var unreachable_nims: usize = 0; // skipped: dish config cannot reach target_pos
     var f: u32 = if (fe_index) |fi| fi else 0;
     const f_end: u32 = if (fe_index) |fi| fi + 1 else 16;
     while (f < f_end) : (f += 1) {
@@ -1093,6 +1095,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 }
                 if (cli_port == null) diseqc_port = cfg.portFor(target_pos);
             } else if (fe_index == null) {
+                unreachable_nims += 1;
                 continue; // this NIM cannot reach the target position - skip
             } else {
                 std.debug.print("[satscan] frontend{d}: NIM not configured for {d}.{d}E - trying anyway\n", .{ f, target_pos / 10, target_pos % 10 });
@@ -1130,6 +1133,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             ncand += 1;
         }
         var cand_locked = false;
+        tuners_tried += 1;
         var ci: usize = 0;
         while (ci < ncand) : (ci += 1) {
             var pc = p_eff;
@@ -1162,7 +1166,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         _ = linux.close(fd);
     }
     if (fe < 0) {
-        std.debug.print("[satscan] no tuner achieved LOCK on {d}.{d}E\n", .{ target_pos / 10, target_pos % 10 });
+        // "did not lock" and "no tuner can even reach this position" are different
+        // faults: the first means no signal, the second a dish/DiSEqC config that
+        // never lists the target. Reporting both as NoLock invites wrong diagnoses.
+        if (tuners_tried == 0 and unreachable_nims > 0) {
+            std.debug.print("[satscan] no tuner is configured for {d}.{d}E ({d} NIM(s) skipped) - nothing was tuned\n", .{ target_pos / 10, target_pos % 10, unreachable_nims });
+            return error.PositionNotConfigured;
+        }
+        std.debug.print("[satscan] no tuner achieved LOCK on {d}.{d}E ({d} tuner(s) tried)\n", .{ target_pos / 10, target_pos % 10, tuners_tried });
         return error.NoLock;
     }
     defer _ = linux.close(fe);
