@@ -16,6 +16,7 @@ Supported providers (`--provider`):
 | `tivusat` | Tivùsat (IT) | NIT actual+other, descriptor 0x83 |
 | `nova` | Nova (GR) | BAT 0x0001, descriptor 0x93 |
 | `vivacom` | Vivacom (BG) | BAT 0x6158, descriptor 0xE2 |
+| `bistv` | BIS TV (FR) | BAT 0x0132, descriptor 0x83 in the bouquet-descriptor loop |
 
 Astra 19.2E (`--pos 192`, needs a dish/DiSEqC port for that position) —
 **verified on air** (services + LCN, two consecutive runs bit-identical):
@@ -55,11 +56,13 @@ That is usually all — the tool configures itself:
 
 - reads `/etc/enigma2/settings`, skips NIMs that cannot reach the target
   orbital position, recognises **Unicable/SCR (EN50494)**, plain universal LNB
-  (voltage + 22 kHz tone) and **committed DiSEqC switches** — the port comes
-  from `diseqcA..D` (simple mode) or `advanced.sat.<pos>.commitedDiseqcCommand`
-  (advanced), so multi-satellite dishes work without extra flags; the committed
-  command is followed by the mini-DiSEqC tone burst (A/B) that enigma also sends,
-  for switches that only react to the burst,
+  (voltage + 22 kHz tone), **committed DiSEqC switches** and **DiSEqC 1.1
+  uncommitted switches** (cascaded dishes, `diseqcMode=1_1`) — the ports come
+  from `diseqcA..D` (simple mode), or in advanced mode are resolved through
+  `advanced.sat.<pos>.lnb` to the LNB block's committed/uncommitted commands, so
+  multi-satellite dishes work without extra flags; the committed command is
+  followed by the uncommitted one and the mini-DiSEqC tone burst (A/B) that
+  enigma also sends, for switches that only react to the burst,
 - tries successive frontends until one both opens (busy tuners return
   `EBUSY` and are skipped) and achieves **LOCK**,
 - keeps scanning until the bouquet table is **complete** (BAT section tracking),

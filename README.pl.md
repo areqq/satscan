@@ -15,6 +15,7 @@ Obsługiwani providerzy (`--provider`):
 | `tivusat` | Tivùsat (IT) | NIT actual+other, deskryptor 0x83 |
 | `nova` | Nova (GR) | BAT 0x0001, deskryptor 0x93 |
 | `vivacom` | Vivacom (BG) | BAT 0x6158, deskryptor 0xE2 |
+| `bistv` | BIS TV (FR) | BAT 0x0132, deskryptor 0x83 w pętli deskryptorów bukietu |
 
 Astra 19.2E (`--pos 192`, wymaga anteny/portu DiSEqC na tę pozycję) —
 **zweryfikowane na sygnale** (usługi + LCN, dwa kolejne przebiegi bit w bit takie same):
@@ -56,11 +57,13 @@ Zwykle to wszystko — narzędzie konfiguruje się samo:
 
 - czyta `/etc/enigma2/settings`, pomija NIM-y niesięgające docelowej pozycji
   orbitalnej, rozpoznaje **Unicable/SCR (EN50494)**, zwykły uniwersalny LNB
-  (napięcie + ton 22 kHz) oraz **przełączniki committed DiSEqC** — port bierze
-  z `diseqcA..D` (tryb prosty) albo `advanced.sat.<pos>.commitedDiseqcCommand`
-  (zaawansowany), więc anteny wielosatelitarne działają bez dodatkowych flag; po
-  komendzie committed idzie jeszcze mini-DiSEqC tone burst (A/B), który wysyła też
-  enigma — dla przełączników reagujących wyłącznie na burst,
+  (napięcie + ton 22 kHz), **przełączniki committed DiSEqC** oraz
+  **uncommitted DiSEqC 1.1** (anteny kaskadowe, `diseqcMode=1_1`) — porty biorą
+  się z `diseqcA..D` (tryb prosty), a w trybie zaawansowanym są rozwiązywane przez
+  `advanced.sat.<pos>.lnb` do komend committed/uncommitted bloku LNB, więc anteny
+  wielosatelitarne działają bez dodatkowych flag; po komendzie committed idzie
+  uncommitted i mini-DiSEqC tone burst (A/B), który wysyła też enigma — dla
+  przełączników reagujących wyłącznie na burst,
 - próbuje kolejnych frontendów, aż któryś się otworzy (zajęte tunery zwracają
   `EBUSY` i są pomijane) **i** złapie LOCK,
 - skanuje aż tablica bukietu będzie **kompletna** (śledzenie sekcji BAT): po
