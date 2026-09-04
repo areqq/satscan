@@ -62,8 +62,10 @@ That is usually all — the tool configures itself:
   for switches that only react to the burst,
 - tries successive frontends until one both opens (busy tuners return
   `EBUSY` and are skipped) and achieves **LOCK**,
-- keeps scanning until the bouquet table is **complete**
-  (BAT section tracking), not just for a fixed time.
+- keeps scanning until the bouquet table is **complete** (BAT section tracking),
+  not just for a fixed time: past the nominal window it reads on while new
+  services, LCNs or sections keep arriving and stops after 15 s of silence, so
+  slow, large tables finish while fast platforms wait for nothing.
 
 Options:
 
@@ -77,7 +79,7 @@ Options:
 | `--dry-run` | print the dish/tuner decision (positions, DiSEqC port, unicable) and exit without touching the tuner |
 | `--lnb-lo/hi/sw kHz` | universal LNB parameters (defaults 9750/10600/11700 MHz) |
 | `--secs S` | LOCK wait per tuner (default 8) |
-| `--scan-secs S` | base scan time (default 25; extends up to 4× until BAT completes) |
+| `--scan-secs S` | base scan time (default 25; extends while data still arrives, stops after 15 s idle) |
 
 ## Output format
 

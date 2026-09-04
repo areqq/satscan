@@ -81,7 +81,7 @@ Opcje:
 | `--dry-run` | wypisuje decyzję o antenie/tunerze (pozycje, port DiSEqC, unicable) i kończy, nie dotykając tunera |
 | `--lnb-lo/hi/sw kHz` | parametry uniwersalnego LNB (domyślnie 9750/10600/11700 MHz) |
 | `--secs S` | czekanie na LOCK per tuner (domyślnie 8) |
-| `--scan-secs S` | bazowy czas skanu (domyślnie 25; wydłuża się do 4× aż BAT będzie kompletny) |
+| `--scan-secs S` | bazowy czas skanu (domyślnie 25; przedłuża się póki napływają dane, kończy po 15 s ciszy) |
 
 ## Format wyjścia
 
