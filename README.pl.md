@@ -17,7 +17,7 @@ Obsługiwani providerzy (`--provider`):
 | `vivacom` | Vivacom (BG) | BAT 0x6158, deskryptor 0xE2 |
 
 Astra 19.2E (`--pos 192`, wymaga anteny/portu DiSEqC na tę pozycję) —
-**zaimplementowane, jeszcze nieprzetestowane na sygnale**:
+**zweryfikowane na sygnale** (usługi + LCN, dwa kolejne przebiegi bit w bit takie same):
 
 | klucz | platforma | źródło LCN |
 |---|---|---|
@@ -29,6 +29,10 @@ Astra 19.2E (`--pos 192`, wymaga anteny/portu DiSEqC na tę pozycję) —
 | `telesat` | TeleSAT (BE) | NIT pid 0x399, prywatna tablica 0xBC |
 | `austriasat` | Austriasat (AT) | NIT pid 0x3B6, prywatna tablica 0xBC |
 | `diveo` | Diveo (DE) | NIT pid 0x3C0, prywatna tablica 0xBC |
+
+Na sygnale pięć platform M7 zwraca te same 142 usługi, ale pięć różnych zestawów
+LCN (657 / 661 / 644 / 356 / 218 wpisów) — to najczytelniejsze potwierdzenie, że
+prywatny PID NIT każdej z nich jest czytany poprawnie.
 
 Pięć platform M7 dzieli jeden transponder domowy (12515 H) i różni się wyłącznie
 prywatnym PID-em NIT, na którym siedzi ich ramówka.

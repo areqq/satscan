@@ -18,7 +18,7 @@ Supported providers (`--provider`):
 | `vivacom` | Vivacom (BG) | BAT 0x6158, descriptor 0xE2 |
 
 Astra 19.2E (`--pos 192`, needs a dish/DiSEqC port for that position) —
-**implemented, not yet verified on air**:
+**verified on air** (services + LCN, two consecutive runs bit-identical):
 
 | key | platform | LCN source |
 |---|---|---|
@@ -32,7 +32,9 @@ Astra 19.2E (`--pos 192`, needs a dish/DiSEqC port for that position) —
 | `diveo` | Diveo (DE) | NIT pid 0x3C0, private table 0xBC |
 
 The five M7 platforms share one home transponder (12515 H) and differ only by
-the private NIT pid their line-up lives on.
+the private NIT pid their line-up lives on - on air they return the same 142
+services but five distinct LCN sets (657 / 661 / 644 / 356 / 218 entries), which
+is the clearest confirmation that the per-platform NIT pid is read correctly.
 
 *Dokumentacja po polsku: [README.pl.md](README.pl.md)*
 
@@ -145,6 +147,8 @@ layouts were derived from [SatScanLcn](https://github.com/Huevos/SatScanLcn)
 | FBC box (8×) | armv7l | Unicable EN50494 (Sharp, auto-configured from settings) |
 | ARM box (no NEON) | armv7l | universal LNB |
 | MIPS box | mipsel r1 | universal LNB |
+| FBC box (8×) | armv7l | A/B DiSEqC switch: 13.0E + 19.2E |
 
-Full captures from all four boxes are **bit-identical** (Canal+: 38 T / 644 S /
-629 L; Polsat: 42 T / 333 S / 298 L).
+Full captures from the 13E boxes are **bit-identical** (Canal+: 38 T / 644 S /
+629 L; Polsat: 42 T / 333 S / 298 L). The 19.2E platforms were captured on the
+A/B-switch box, likewise identical across consecutive runs.
