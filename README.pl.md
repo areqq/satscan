@@ -69,14 +69,13 @@ Zwykle to wszystko — narzędzie konfiguruje się samo:
 - skanuje aż tablica bukietu będzie **kompletna** (śledzenie sekcji BAT): po
   nominalnym oknie `--scan-secs` czyta dalej, dopóki napływają nowe usługi, LCN-y
   lub sekcje, i kończy po 15 s ciszy — dzięki temu wolne, wielkie tablice (BAT
-  Sky) dochodzą do końca, a szybkie platformy na nic nie czekają,
-  a nie tylko przez sztywny czas.
+  Sky) dochodzą do końca, a szybkie platformy na nic nie czekają.
 
 Opcje:
 
 | opcja | znaczenie |
 |---|---|
-| `--provider canalplus\|polsat` | którą platformę skanować (wymagane) |
+| `--provider <klucz>` | którą platformę skanować (wymagane, chyba że `--scan-all`; klucze w tabelach wyżej, `--help` je wypisuje) |
 | `--adapter N` / `--frontend N` / `--demux N` | przypięcie konkretnych urządzeń (domyślnie: auto) |
 | `--settings ŚCIEŻKA` | ustawienia enigmy (domyślnie `/etc/enigma2/settings`) |
 | `--scr-slot N --scr-freq MHz` | wymuszenie Unicable EN50494 (nadpisuje settings) |
@@ -123,6 +122,20 @@ dla parametrów transponderów domowych i układów deskryptorów LCN (0x82 NIT 
 0x83 BAT). satscan to niezależna implementacja od zera (Zig, surowe syscalle,
 bez zależności od Enigma2), nie port tamtego kodu.
 
+## Układ źródeł
+
+| plik | rola |
+|---|---|
+| `src/dvb.zig` | Linux DVB API: strojenie (DiSEqC committed/uncommitted, Unicable, LNB), filtry sekcji demuxa, pompa sekcji, surowe syscalle, buforowane stdout |
+| `src/si.zig` | parsery DVB SI: SDT, NIT/BAT z układami LCN per platforma, satellites.xml |
+| `src/settings.zig` | `/etc/enigma2/settings` → model anteny per NIM (pozycje, porty, SCR) |
+| `src/providers.zig` | tabela platform |
+| `src/main.zig` | CLI, wybór tunera, dwa tryby skanu |
+
+Każde pole długości odczytane z eteru jest sprawdzane: build to ReleaseSmall
+(bez runtime safety), więc zniekształcona sekcja nie może stać się cichym
+odczytem poza zakresem.
+
 ## Budowanie
 
 ```sh
@@ -134,8 +147,7 @@ Dwa przenośne warianty — dobrane po bolesnych testach:
 - **satscan-armhf** — ARMv7 + VFPv3-D16, **NEON jawnie wyłączony**: część
   SoC-ów STB (czesc ARM-owych STB) nie ma NEON i domyślny baseline daje SIGILL;
   build bez NEON działa na każdym testowanym ARM-ie, także tych z NEON-em.
-- **satscan-mipsel** — MIPS32 **r1**: starsze Broadcomy MIPS (np. BCM7362
-  ) dają SIGILL na instrukcjach r2. Dodatkowo MIPS inaczej
+- **satscan-mipsel** — MIPS32 **r1**: starsze Broadcomy MIPS (np. BCM7362) dają SIGILL na instrukcjach r2. Dodatkowo MIPS inaczej
   koduje numery `ioctl` — kod używa arch-aware `std.os.linux.IOCTL`.
 
 CI buduje oba warianty przy każdym pushu, a na tagach `satscan-v*` publikuje
@@ -157,4 +169,4 @@ projekt zachowuje tę samą licencję.
 | MIPS box | mipsel r1 | uniwersalny LNB |
 
 Pełne zgrania z wszystkich czterech dekoderów są **bitowo identyczne**
-(Canal+: 38 T / 644 S / 629 L; Polsat: 42 T / 333 S / 298 L).
+(Canal+: 38 T / 644 S / 629 L; Polsat: 42 T / 335 S / 297 L).

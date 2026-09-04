@@ -74,7 +74,7 @@ Options:
 
 | option | meaning |
 |---|---|
-| `--provider canalplus\|polsat` | which platform to scan (required) |
+| `--provider <key>` | which platform to scan (required unless `--scan-all`; keys in the tables above, `--help` lists them) |
 | `--adapter N` / `--frontend N` / `--demux N` | pin specific devices (default: auto) |
 | `--settings PATH` | enigma settings path (default `/etc/enigma2/settings`) |
 | `--scr-slot N --scr-freq MHz` | force Unicable EN50494 (overrides settings) |
@@ -120,6 +120,20 @@ parameters and the LCN descriptor layouts (0x82 NIT / 0x83 BAT) used here.
 satscan is an independent from-scratch implementation (Zig, raw syscalls,
 no Enigma2 dependency), not a port of its code.
 
+## Source layout
+
+| file | role |
+|---|---|
+| `src/dvb.zig` | Linux DVB API: tuning (DiSEqC committed/uncommitted, Unicable, LNB), demux section filters, section pump, raw-syscall I/O, buffered stdout |
+| `src/si.zig` | DVB SI parsers: SDT, NIT/BAT with the per-platform LCN layouts, satellites.xml |
+| `src/settings.zig` | `/etc/enigma2/settings` → per-NIM dish model (positions, ports, SCR) |
+| `src/providers.zig` | the platform table |
+| `src/main.zig` | CLI, tuner selection, the two scan modes |
+
+Every length field read from the air is bounds-checked: the build is ReleaseSmall
+(no runtime safety), so a malformed section must never become a silent
+out-of-range read.
+
 ## Building
 
 ```sh
@@ -131,8 +145,7 @@ Two portable flavours, chosen the hard way:
 - **satscan-armhf** — ARMv7 + VFPv3-D16, **NEON explicitly disabled**: some
   STB SoCs (some ARM STBs) lack NEON and the default baseline SIGILLs; the
   no-NEON build runs on every ARM box we tried, NEON-capable ones included.
-- **satscan-mipsel** — MIPS32 **r1**: older Broadcom MIPS (e.g. BCM7362
-  ) SIGILL on r2 instructions. Also note MIPS encodes `ioctl`
+- **satscan-mipsel** — MIPS32 **r1**: older Broadcom MIPS (e.g. BCM7362) SIGILL on r2 instructions. Also note MIPS encodes `ioctl`
   numbers differently — the code uses arch-aware `std.os.linux.IOCTL`.
 
 CI builds both flavours on every push and publishes GitHub Releases with
@@ -155,5 +168,5 @@ layouts were derived from [SatScanLcn](https://github.com/Huevos/SatScanLcn)
 | FBC box (8×) | armv7l | A/B DiSEqC switch: 13.0E + 19.2E |
 
 Full captures from the 13E boxes are **bit-identical** (Canal+: 38 T / 644 S /
-629 L; Polsat: 42 T / 333 S / 298 L). The 19.2E platforms were captured on the
+629 L; Polsat: 42 T / 335 S / 297 L). The 19.2E platforms were captured on the
 A/B-switch box, likewise identical across consecutive runs.
