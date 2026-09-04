@@ -267,6 +267,10 @@ const PROVIDERS = [_]Provider{
     .{ .key = "skyitalia", .name = "Sky Italia", .freq = 11881000, .sr = 27500000, .pol_h = false, .fec = FEC_3_4, .sys = SYS_DVBS, .mod = QPSK, .onid = 64511, .tsid = 5800, .bat_bouquet_id = 0x6250, .bat_lcn_desc = 0xb1 },
     .{ .key = "tivusat", .name = "Tivusat", .freq = 10992000, .sr = 27500000, .pol_h = false, .fec = FEC_2_3, .sys = SYS_DVBS, .mod = QPSK, .onid = 318, .tsid = 12400, .nit_lcn_desc = 0x83, .nit_other = true },
     .{ .key = "vivacom", .name = "Vivacom", .freq = 12713000, .sr = 30000000, .pol_h = false, .fec = FEC_5_6, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 213, .tsid = 10000, .bat_bouquet_id = 0x6158, .bat_lcn_desc = 0xe2 },
+    // BIS TV (13E). SatScanLcn's listed home TP (11681 H) is off air; this live
+    // network SI transponder (11900 H, ONID 0x013F, from an off-air lamedb)
+    // carries the BAT of bouquet 0x0132.
+    .{ .key = "bistv", .name = "BIS TV (13E)", .freq = 11900000, .sr = 27500000, .pol_h = true, .fec = FEC_3_4, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 0x013f, .tsid = 0x170c, .bat_bouquet_id = 0x0132, .bat_lcn_desc = 0x83 },
 
     // --- Astra 19.2E ---------------------------------------------------------
     // M7 group: one shared home transponder, each platform has its own private
@@ -572,6 +576,41 @@ fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc
     const end = total - 4; // bez CRC
     loop_fuse = 0;
     const net_desc_len = (@as(usize, section[8] & 0x0f) << 8) | section[9];
+    // Most networks carry the LCN descriptor per-transport in the TS loop, but
+    // some (BIS TV) put a single one in the bouquet/network descriptor loop
+    // covering every service by SID. Scan that loop first when it holds our LCN
+    // descriptor; here there is no per-entry tsid/onid, so services are keyed by
+    // SID against the section's own onid.
+    if (lcn_desc != 0 and net_desc_len > 0) {
+        const sec_onid = u16be(section, 3); // BAT: bytes 3-4 are bouquet_id, not onid
+        _ = sec_onid;
+        var bd: usize = 10;
+        const bd_end = @min(10 + net_desc_len, end);
+        while (bd + 2 <= bd_end) {
+            const btag = section[bd];
+            const blen = section[bd + 1];
+            const bbody = section[bd + 2 .. @min(bd + 2 + blen, bd_end)];
+            if (btag == lcn_desc) {
+                // In the bouquet-descriptor loop the LCN descriptor is fully
+                // addressed: 8-byte entries onid(2) tsid(2) sid(2) lcn(2), unlike
+                // the 4-byte sid+lcn form inside a TS loop (where onid/tsid come
+                // from the loop). BIS TV numbers its whole bouquet this way.
+                var q: usize = 0;
+                while (q + 8 <= bbody.len) : (q += 8) {
+                    const e_onid = u16be(bbody, q);
+                    const e_tsid = u16be(bbody, q + 2);
+                    const sid = u16be(bbody, q + 4);
+                    const visible = (bbody[q + 6] >> 7) & 1;
+                    // 10-bit field with the low 4 bits reserved (always set): the
+                    // channel number lives in the upper bits.
+                    const raw = (@as(u16, bbody[q + 6] & 0x03) << 8) | bbody[q + 7];
+                    const lcn = raw >> 4;
+                    if (lcn > 0) emitLcn(out, seen_lcn, lcn_src, lcn, sid, e_tsid, e_onid, visible, null);
+                }
+            }
+            bd += 2 + @as(usize, blen);
+        }
+    }
     var pos: usize = 10 + net_desc_len;
     if (pos + 2 > end) return;
     pos += 2; // transport_stream_loop_length
@@ -1017,7 +1056,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // probe the tuner, so borrow them from the first XML transponder later.
         Provider{ .key = "scan", .name = "scan-all", .freq = 0, .sr = 0, .pol_h = false, .fec = FEC_AUTO, .sys = SYS_DVBS2, .mod = PSK_8, .onid = 0, .tsid = 0 }
     else findProvider(provider_key) orelse {
-        std.debug.print("[satscan] unknown provider '{s}' (canalplus|polsat|nova|skyitalia|tivusat|vivacom)\n", .{provider_key});
+        std.debug.print("[satscan] unknown provider '{s}' (canalplus|polsat|nova|skyitalia|tivusat|vivacom|bistv)\n", .{provider_key});
         return error.BadProvider;
     };
 
