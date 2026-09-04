@@ -400,6 +400,27 @@ fn waitLock(fd: i32, secs: u32) bool {
     return false;
 }
 
+// A demod can raise FE_HAS_LOCK with no transport stream behind it - seen on FBC
+// tuners whose input carries no signal, where every frequency "locks" and the
+// scan then silently yields nothing. Every real DVB stream carries a PAT, so
+// treat "lock but not one PAT section" as no lock and move on to the next tuner.
+fn streamAlive(dmx_path: [*:0]const u8, frontend: u32, ms: i64) bool {
+    const dfd = demuxOpenFor(dmx_path, frontend) orelse return false;
+    defer _ = linux.close(dfd);
+    setSectionFilter(dfd, 0x00, 0x00, 0xff, null) catch return false;
+    var fds = [_]linux.pollfd{.{ .fd = @intCast(dfd), .events = linux.POLL.IN, .revents = 0 }};
+    var secbuf: [4096]u8 = undefined;
+    const deadline = nowMs() + ms;
+    while (nowMs() < deadline) {
+        const nr = linux.poll(&fds, 1, 300);
+        if (linux.errno(nr) != .SUCCESS or nr == 0) continue;
+        if (fds[0].revents & linux.POLL.IN == 0) continue;
+        const n = linux.read(dfd, &secbuf, secbuf.len);
+        if (linux.errno(n) == .SUCCESS and n >= 8) return true;
+    }
+    return false;
+}
+
 fn setSectionFilter(fd: i32, pid: u16, table_id: u8, table_mask: u8, ext_id: ?u16) !void {
     var params = dmx_sct_filter_params{
         .pid = pid,
@@ -1077,6 +1098,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Auto-selection: successive frontends; NIM config from settings; busy (EBUSY)
     // or no LOCK -> next one. --frontend pins a specific tuner.
     var pathbuf: [64]u8 = undefined;
+    var probebuf: [64]u8 = undefined;
+    const dmx_probe_path = try std.fmt.bufPrintZ(&probebuf, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, demux });
     var fe: i32 = -1;
     var chosen_fe: u32 = 0;
     var chosen_port: ?u8 = null;
@@ -1150,6 +1173,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 ok = waitLock(fd, secs);
             }
             if (ok) {
+                // guard against a lock with no stream behind it (see streamAlive)
+                if (!streamAlive(dmx_probe_path, f, 2500)) {
+                    std.debug.print("[satscan] frontend{d}: LOCK but no stream (no PAT) - ignoring\n", .{f});
+                    ok = false;
+                    continue;
+                }
                 p_eff = pc; // downstream table reads use the TP that actually locked
                 cand_locked = true;
                 break;
