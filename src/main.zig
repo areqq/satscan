@@ -324,7 +324,7 @@ fn ioctlChecked(fd: i32, request: u32, arg: usize, what: []const u8) !void {
 const Lnb = struct { lo: u32 = 9750000, hi: u32 = 10600000, sw: u32 = 11700000 };
 const Scr = struct { slot: u8, freq_mhz: u32 }; // Unicable EN50494 user band
 
-fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8) !void {
+fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8, uncommitted: ?u8) !void {
     const high = p.freq >= lnb.sw;
     var ifreq: u32 = if (high) p.freq - lnb.hi else p.freq - lnb.lo;
 
@@ -352,24 +352,40 @@ fn tune(fd: i32, p: Provider, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8) !void {
     } else {
         const voltage: u32 = if (p.pol_h) SEC_VOLTAGE_18 else SEC_VOLTAGE_13;
         const tone: u32 = if (high) SEC_TONE_ON else SEC_TONE_OFF;
-        if (diseqc_port) |port| {
-            // committed switch (2/4-way, also monoblocks): tone off, 18V for a
-            // reliable command, then E0 10 38 <F0|port<<2|pol<<1|band>
+        if (diseqc_port != null or uncommitted != null) {
+            // A committed and/or DiSEqC 1.1 uncommitted switch: tone off, 18V for
+            // a reliable command, then send (order: committed, uncommitted, tone
+            // burst - the "cut" order enigma uses for cascaded switches).
             try ioctlChecked(fd, FE_SET_TONE, SEC_TONE_OFF, "FE_SET_TONE");
             try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_18, "FE_SET_VOLTAGE(18)");
             sleepMs(15);
-            var cmd = dvb_diseqc_master_cmd{ .msg = .{
-                0xE0, 0x10, 0x38,
-                0xF0 | (@as(u8, port & 0x03) << 2) | (@as(u8, @intFromBool(p.pol_h)) << 1) | @as(u8, @intFromBool(high)),
-                0, 0,
-            }, .msg_len = 4 };
-            try ioctlChecked(fd, FE_DISEQC_SEND_MASTER_CMD, @intFromPtr(&cmd), "FE_DISEQC_SEND_MASTER_CMD");
-            sleepMs(54); // spec: >=15ms, switches like a bit more
-            // Many 2-way switches (and the a/b mode enigma uses) only react to
-            // the mini-DiSEqC tone burst, so send it as well: A for even ports,
-            // B for odd ones.
-            try ioctlChecked(fd, FE_DISEQC_SEND_BURST, @as(usize, port & 1), "FE_DISEQC_SEND_BURST");
-            sleepMs(30);
+            if (diseqc_port) |port| {
+                // committed (2/4-way, monoblocks): E0 10 38 <F0|port<<2|pol<<1|band>
+                var cmd = dvb_diseqc_master_cmd{ .msg = .{
+                    0xE0, 0x10, 0x38,
+                    0xF0 | (@as(u8, port & 0x03) << 2) | (@as(u8, @intFromBool(p.pol_h)) << 1) | @as(u8, @intFromBool(high)),
+                    0, 0,
+                }, .msg_len = 4 };
+                try ioctlChecked(fd, FE_DISEQC_SEND_MASTER_CMD, @intFromPtr(&cmd), "FE_DISEQC_SEND_MASTER_CMD");
+                sleepMs(54); // spec: >=15ms, switches like a bit more
+            }
+            if (uncommitted) |up| {
+                // DiSEqC 1.1 uncommitted switch (up to 16 ports): E0 10 39
+                // <F0|(port-1)>. Ports are numbered 1..16 in settings.
+                const idx: u8 = if (up > 0) up - 1 else 0;
+                var ucmd = dvb_diseqc_master_cmd{ .msg = .{
+                    0xE0, 0x10, 0x39, 0xF0 | (idx & 0x0F), 0, 0,
+                }, .msg_len = 4 };
+                try ioctlChecked(fd, FE_DISEQC_SEND_MASTER_CMD, @intFromPtr(&ucmd), "FE_DISEQC_SEND_MASTER_CMD(uncommitted)");
+                sleepMs(54);
+            }
+            // Many 2-way switches (and enigma's a/b mode) only react to the
+            // mini-DiSEqC tone burst, so send it as well when a committed port is
+            // in play: A for even ports, B for odd ones.
+            if (diseqc_port) |port| {
+                try ioctlChecked(fd, FE_DISEQC_SEND_BURST, @as(usize, port & 1), "FE_DISEQC_SEND_BURST");
+                sleepMs(30);
+            }
         }
         // tone/voltage by band and polarisation (universal LNB)
         try ioctlChecked(fd, FE_SET_VOLTAGE, voltage, "FE_SET_VOLTAGE");
@@ -699,6 +715,7 @@ fn parseNitLike(section: []const u8, table_id_want: u8, want_ext: ?u16, lcn_desc
 // ---------- tuner configuration from /etc/enigma2/settings ----------
 const NimMode = enum { unknown, simple, advanced, nothing, equal, loopthrough, satposdepends };
 const MAX_SATS = 8;
+const MAX_LNB = 33; // enigma numbers advanced LNB blocks 1..32
 
 // One tuner's dish setup: which orbital positions it can reach and, for each,
 // which committed DiSEqC port selects it (null = no switch, single LNB).
@@ -710,6 +727,15 @@ const NimCfg = struct {
     positions: [MAX_SATS]u32 = [_]u32{0} ** MAX_SATS,
     ports: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS,
     has_port: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
+    // Uncommitted DiSEqC (1.1) port per position, and, for advanced mode, the LNB
+    // block each position maps to. In advanced dishes the DiSEqC commands live in
+    // the LNB block (advanced.lnb.<N>.*), not the sat block, so we buffer them and
+    // resolve position -> lnb -> {committed, uncommitted} in finalizeAdvanced().
+    uports: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS,
+    has_uport: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
+    lnb_of: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS, // 0 = unset
+    lnb_comm: [MAX_LNB]i16 = [_]i16{-1} ** MAX_LNB,
+    lnb_uncomm: [MAX_LNB]i16 = [_]i16{-1} ** MAX_LNB,
     nsat: usize = 0,
     unicable: bool = false, // from the advanced LNB block
     scr_slot: u8 = 0,
@@ -744,6 +770,43 @@ const NimCfg = struct {
             self.has_port[self.nsat] = true;
         }
         self.nsat += 1;
+    }
+
+    fn setSatLnb(self: *NimCfg, pos: u32, lnb: u8) void {
+        self.addSat(pos, null);
+        var i: usize = 0;
+        while (i < self.nsat) : (i += 1) {
+            if (self.positions[i] == pos) {
+                self.lnb_of[i] = lnb;
+                return;
+            }
+        }
+    }
+
+    // Resolve advanced position -> LNB block -> committed/uncommitted ports.
+    fn finalizeAdvanced(self: *NimCfg) void {
+        if (self.mode != .advanced) return;
+        var i: usize = 0;
+        while (i < self.nsat) : (i += 1) {
+            const lnb = self.lnb_of[i];
+            if (lnb == 0 or lnb >= MAX_LNB) continue;
+            if (!self.has_port[i] and self.lnb_comm[lnb] >= 0) {
+                self.ports[i] = @intCast(self.lnb_comm[lnb]);
+                self.has_port[i] = true;
+            }
+            if (self.lnb_uncomm[lnb] > 0) { // 0 = no uncommitted switch
+                self.uports[i] = @intCast(self.lnb_uncomm[lnb]);
+                self.has_uport[i] = true;
+            }
+        }
+    }
+
+    fn uportFor(self: NimCfg, pos: u32) ?u8 {
+        var i: usize = 0;
+        while (i < self.nsat) : (i += 1) {
+            if (self.positions[i] == pos and self.has_uport[i]) return self.uports[i];
+        }
+        return null;
     }
 
     // An A/B switch only has ports 0 and 1; diseqcC/D are stale leftovers there.
@@ -855,8 +918,23 @@ fn parseSettings(path: [*:0]const u8, nims: []NimCfg) bool {
             const sub = rest2[dot2 + 1 ..];
             if (std.mem.startsWith(u8, sub, "commitedDiseqcCommand=") or std.mem.startsWith(u8, sub, "committedDiseqcCommand=")) {
                 c.addSat(pos, parseCommitted(valueAfterEq(sub)));
+            } else if (std.mem.eql(u8, sub, "lnb=") or std.mem.startsWith(u8, sub, "lnb=")) {
+                const n = std.fmt.parseInt(u8, valueAfterEq(sub), 10) catch 0;
+                c.setSatLnb(pos, n);
             } else {
                 c.addSat(pos, null);
+            }
+        } else if (std.mem.startsWith(u8, kv, "advanced.lnb.")) {
+            // advanced.lnb.<N>.<key>=<value> — the DiSEqC commands for that block
+            const rest2 = kv["advanced.lnb.".len..];
+            const dot2 = std.mem.indexOfScalar(u8, rest2, '.') orelse continue;
+            const n = std.fmt.parseInt(u8, rest2[0..dot2], 10) catch continue;
+            if (n == 0 or n >= MAX_LNB) continue;
+            const sub = rest2[dot2 + 1 ..];
+            if (std.mem.startsWith(u8, sub, "commitedDiseqcCommand=") or std.mem.startsWith(u8, sub, "committedDiseqcCommand=")) {
+                if (parseCommitted(valueAfterEq(sub))) |pt| c.lnb_comm[n] = pt;
+            } else if (std.mem.startsWith(u8, sub, "uncommittedDiseqcCommand=")) {
+                c.lnb_uncomm[n] = std.fmt.parseInt(i16, valueAfterEq(sub), 10) catch -1;
             }
         } else if (std.mem.indexOf(u8, kv, ".lof=unicable") != null) {
             c.unicable = true;
@@ -867,6 +945,7 @@ fn parseSettings(path: [*:0]const u8, nims: []NimCfg) bool {
             c.scr_slot = if (n > 0) n - 1 else 0; // UB number (1-based) -> EN50494 index
         }
     }
+    for (nims) |*c| c.finalizeAdvanced();
     return true;
 }
 
@@ -889,7 +968,7 @@ fn effectiveNim(nims: []const NimCfg, idx: usize, pos: u32) ?NimCfg {
 // Full-satellite scan: walk every transponder from the queue (seeded from
 // satellites.xml, extended live with NIT discoveries), grab SDT actual + NIT
 // on each, emit T/S lines. LCN is provider-specific, so none here.
-fn scanAll(fe: i32, fe_num: u32, dmx_path: [*:0]const u8, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8,
+fn scanAll(fe: i32, fe_num: u32, dmx_path: [*:0]const u8, lnb: Lnb, scr: ?Scr, diseqc_port: ?u8, uncommitted: ?u8,
            queue: *TpQueue, lock_secs: u32, tp_secs: u32, max_tp: usize, pos_label: u32,
            out: *Out, alloc: std.mem.Allocator) !void {
     var seen = std.AutoHashMap(u32, void).init(alloc);
@@ -907,7 +986,7 @@ fn scanAll(fe: i32, fe_num: u32, dmx_path: [*:0]const u8, lnb: Lnb, scr: ?Scr, d
         tried += 1;
         const tp = queue.items[i];
         const prov = Provider{ .key = "", .name = "", .freq = tp.freq, .sr = tp.sr, .pol_h = tp.pol == 0, .fec = tp.fec, .sys = tp.sys, .mod = tp.mod, .onid = 0, .tsid = 0, .pos = pos_label };
-        tune(fe, prov, lnb, scr, diseqc_port) catch {
+        tune(fe, prov, lnb, scr, diseqc_port, uncommitted) catch {
             out.line("# tp {d}{c} sr={d} lock=err\n", .{ tp.freq, POLCHARS[tp.pol], tp.sr });
             continue;
         };
@@ -1122,8 +1201,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             const eff = effectiveNim(&nims, ni, target_pos);
             if (eff) |cfg| {
+                const uc = cfg.uportFor(target_pos);
                 if (cfg.portFor(target_pos)) |pt| {
-                    out_d.line("=> WOULD USE, DiSEqC committed port {d}\n", .{pt});
+                    if (uc) |u| {
+                        out_d.line("=> WOULD USE, DiSEqC committed port {d} + uncommitted {d}\n", .{ pt, u });
+                    } else {
+                        out_d.line("=> WOULD USE, DiSEqC committed port {d}\n", .{pt});
+                    }
+                } else if (uc) |u| {
+                    out_d.line("=> WOULD USE, DiSEqC uncommitted {d}\n", .{u});
                 } else {
                     out_d.line("=> WOULD USE, no switch command\n", .{});
                 }
@@ -1142,6 +1228,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var fe: i32 = -1;
     var chosen_fe: u32 = 0;
     var chosen_port: ?u8 = null;
+    var chosen_uncommitted: ?u8 = null;
     var locked = false;
     var tuners_tried: usize = 0; // frontends we actually tuned
     var unreachable_nims: usize = 0; // skipped: dish config cannot reach target_pos
@@ -1150,12 +1237,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     while (f < f_end) : (f += 1) {
         var scr: ?Scr = cli_scr;
         var diseqc_port: ?u8 = cli_port;
+        var uncommitted: ?u8 = null;
         if (have_settings) {
             if (effectiveNim(&nims, f, target_pos)) |cfg| {
                 if (cli_scr == null and cfg.usesUnicable()) {
                     scr = Scr{ .slot = cfg.scr_slot, .freq_mhz = cfg.scr_freq };
                 }
                 if (cli_port == null) diseqc_port = cfg.portFor(target_pos);
+                uncommitted = cfg.uportFor(target_pos);
             } else if (fe_index == null) {
                 unreachable_nims += 1;
                 continue; // this NIM cannot reach the target position - skip
@@ -1182,6 +1271,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             fe = fd;
             chosen_fe = f;
             chosen_port = diseqc_port;
+            chosen_uncommitted = uncommitted;
             locked = true;
             break;
         }
@@ -1205,10 +1295,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             pc.fec = cands[ci].fec;
             pc.sys = cands[ci].sys;
             pc.mod = cands[ci].mod;
-            tune(fd, pc, lnb, scr, diseqc_port) catch continue;
+            tune(fd, pc, lnb, scr, diseqc_port, uncommitted) catch continue;
             var ok = waitLock(fd, secs);
             if (!ok and scr != null) { // unicable can be moody - one retry
-                tune(fd, pc, lnb, scr, diseqc_port) catch {};
+                tune(fd, pc, lnb, scr, diseqc_port, uncommitted) catch {};
                 ok = waitLock(fd, secs);
             }
             if (ok) {
@@ -1227,6 +1317,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             fe = fd;
             chosen_fe = f;
             chosen_port = diseqc_port;
+            chosen_uncommitted = uncommitted;
             locked = true;
             break;
         }
@@ -1259,7 +1350,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             break :blk null;
         } else null;
-        try scanAll(fe, chosen_fe, dmx_path0, lnb, scr_used, chosen_port, &queue, secs, tp_secs, max_tp, sat_pos, &out_sa, alloc);
+        try scanAll(fe, chosen_fe, dmx_path0, lnb, scr_used, chosen_port, chosen_uncommitted, &queue, secs, tp_secs, max_tp, sat_pos, &out_sa, alloc);
         return;
     }
 
