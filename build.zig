@@ -1,8 +1,8 @@
 const std = @import("std");
 
-// Dwa portable warianty:
-//  - armhf: ARMv7 + VFPv3-D16, BEZ NEON (dziala i na CPU bez NEON, czesc ARM STB)
-//  - mipsel: MIPS32 r1 (starsze Broadcomy, starsze MIPS STB; r2 daje SIGILL)
+// Two portable flavours:
+//  - armhf: ARMv7 + VFPv3-D16, NO NEON (some ARM STB SoCs lack it; this build runs on them too)
+//  - mipsel: MIPS32 r1 (older Broadcom MIPS STBs; r2 instructions SIGILL there)
 const targets = [_]struct { name: []const u8, triple: []const u8, cpu: []const u8 }{
     .{ .name = "satscan-armhf", .triple = "arm-linux-musleabihf", .cpu = "generic+v7a+vfp3d16-neon" },
     .{ .name = "satscan-mipsel", .triple = "mipsel-linux-musl", .cpu = "mips32" },
