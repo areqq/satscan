@@ -63,7 +63,10 @@ Zwykle to wszystko — narzędzie konfiguruje się samo:
   enigma — dla przełączników reagujących wyłącznie na burst,
 - próbuje kolejnych frontendów, aż któryś się otworzy (zajęte tunery zwracają
   `EBUSY` i są pomijane) **i** złapie LOCK,
-- skanuje aż tablica bukietu będzie **kompletna** (śledzenie sekcji BAT),
+- skanuje aż tablica bukietu będzie **kompletna** (śledzenie sekcji BAT): po
+  nominalnym oknie `--scan-secs` czyta dalej, dopóki napływają nowe usługi, LCN-y
+  lub sekcje, i kończy po 15 s ciszy — dzięki temu wolne, wielkie tablice (BAT
+  Sky) dochodzą do końca, a szybkie platformy na nic nie czekają,
   a nie tylko przez sztywny czas.
 
 Opcje:

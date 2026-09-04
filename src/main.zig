@@ -1278,11 +1278,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var bat_got = [_]bool{false} ** 256;
     const t0 = nowMs();
     var idle: u32 = 0;
+    // Past the nominal scan time we keep going while the mux is still telling us
+    // something new: a fixed multiple of the scan time cuts slow, large tables
+    // (Sky's BAT cycles far slower than a typical scan window) yet makes every
+    // fast platform wait for nothing. Progress, not the clock, decides.
+    const stall_ms: i64 = 15000; // no new service/LCN/section for this long = done
+    const abs_cap_ms: i64 = @as(i64, scan_secs) * 12000; // safety net
+    var last_progress = nowMs();
+    var prog_sig: usize = 0;
     while (idle < idle_limit) {
         const elapsed = nowMs() - t0;
+        var bat_sections: usize = 0;
+        for (bat_got) |g| {
+            if (g) bat_sections += 1;
+        }
+        const sig = seen.count() + seen_lcn.count() + seen_tp.count() + bat_sections;
+        if (sig != prog_sig) {
+            prog_sig = sig;
+            last_progress = nowMs();
+        }
         if (elapsed >= @as(i64, scan_secs) * 1000) {
             const bat_done = fd_bat < 0 or batComplete(bat_last, &bat_got);
-            if (bat_done or elapsed >= @as(i64, scan_secs) * 4000) break;
+            const stalled = nowMs() - last_progress >= stall_ms;
+            if (bat_done or stalled or elapsed >= abs_cap_ms) break;
         }
         const nr = linux.poll(&fds_buf, @intCast(nfds), 300);
         if (linux.errno(nr) != .SUCCESS) break;
