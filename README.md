@@ -1,0 +1,172 @@
+# satscan
+
+Standalone, dependency-free binary that scans channel line-ups of the Hot Bird
+13.0E platforms straight off a DVB-S/S2 tuner and prints them as plain text —
+service names, transponders and the operator's logical channel numbers (LCN).
+Written from scratch in **Zig 0.16**, raw Linux syscalls only (no libc, static
+musl binaries ~150–230 KB).
+
+Supported providers (`--provider`):
+
+| key | platform | LCN source |
+|---|---|---|
+| `canalplus` | Platforma Canal+ (PL) | BAT 0x2020, descriptor 0x83 |
+| `polsat` | Polsat Box (PL) | NIT, descriptor 0x82 |
+| `skyitalia` | Sky Italia | BAT 0x6250, Sky private 0xB1 (with regions) |
+| `tivusat` | Tivùsat (IT) | NIT actual+other, descriptor 0x83 |
+| `nova` | Nova (GR) | BAT 0x0001, descriptor 0x93 |
+| `vivacom` | Vivacom (BG) | BAT 0x6158, descriptor 0xE2 |
+| `bistv` | BIS TV (FR) | BAT 0x0132, descriptor 0x83 in the bouquet-descriptor loop |
+
+Astra 19.2E (`--pos 192`, needs a dish/DiSEqC port for that position) —
+**verified on air** (services + LCN, two consecutive runs bit-identical):
+
+| key | platform | LCN source |
+|---|---|---|
+| `tntsat` | TNTSAT (FR) | BAT 0xC00F, descriptor 0x83 |
+| `movistar` | Movistar+ (ES) | BAT 0x0021, descriptor 0x83 |
+| `simplitv` | simpliTV (AT) | BAT 0x3700, descriptor 0x83 |
+| `canaldigitaal` | Canal Digitaal (NL) | NIT pid 0x385, private table 0xBC |
+| `tvvlaanderen` | TV Vlaanderen (BE) | NIT pid 0x38F, private table 0xBC |
+| `telesat` | TeleSAT (BE) | NIT pid 0x399, private table 0xBC |
+| `austriasat` | Austriasat (AT) | NIT pid 0x3B6, private table 0xBC |
+| `diveo` | Diveo (DE) | NIT pid 0x3C0, private table 0xBC |
+
+The five M7 platforms share one home transponder (12515 H) and differ only by
+the private NIT pid their line-up lives on - on air they return the same 142
+services but five distinct LCN sets (657 / 661 / 644 / 356 / 218 entries), which
+is the clearest confirmation that the per-platform NIT pid is read correctly.
+
+*Dokumentacja po polsku: [README.pl.md](README.pl.md)*
+
+## Usage
+
+```sh
+satscan --provider <key> [options] > list.txt      # one platform with LCN
+satscan --scan-all [options] > full.txt            # whole satellite from satellites.xml
+```
+
+`--scan-all` walks every transponder of the configured orbital position from
+`/etc/tuxbox/satellites.xml` (`--pos`, default 130 = 13.0E), extends the queue
+live with transponders discovered in NIT, and captures SDT actual on each
+(~7 min for all of 13.0E). Extra options: `--tp-secs` (per-TP capture window,
+default 4), `--max-tp N` (limit, for quick tests), `--satxml PATH`.
+
+That is usually all — the tool configures itself:
+
+- reads `/etc/enigma2/settings`, skips NIMs that cannot reach the target
+  orbital position, recognises **Unicable/SCR (EN50494)**, plain universal LNB
+  (voltage + 22 kHz tone), **committed DiSEqC switches** and **DiSEqC 1.1
+  uncommitted switches** (cascaded dishes, `diseqcMode=1_1`) — the ports come
+  from `diseqcA..D` (simple mode), or in advanced mode are resolved through
+  `advanced.sat.<pos>.lnb` to the LNB block's committed/uncommitted commands, so
+  multi-satellite dishes work without extra flags; the committed command is
+  followed by the uncommitted one and the mini-DiSEqC tone burst (A/B) that
+  enigma also sends, for switches that only react to the burst,
+- tries successive frontends until one both opens (busy tuners return
+  `EBUSY` and are skipped) and achieves **LOCK**,
+- keeps scanning until the bouquet table is **complete** (BAT section tracking),
+  not just for a fixed time: past the nominal window it reads on while new
+  services, LCNs or sections keep arriving and stops after 15 s of silence, so
+  slow, large tables finish while fast platforms wait for nothing.
+
+Options:
+
+| option | meaning |
+|---|---|
+| `--provider <key>` | which platform to scan (required unless `--scan-all`; keys in the tables above, `--help` lists them) |
+| `--adapter N` / `--frontend N` / `--demux N` | pin specific devices (default: auto) |
+| `--settings PATH` | enigma settings path (default `/etc/enigma2/settings`) |
+| `--scr-slot N --scr-freq MHz` | force Unicable EN50494 (overrides settings) |
+| `--diseqc-port N` | force committed DiSEqC port 0–3 (overrides settings) |
+| `--dry-run` | print the dish/tuner decision (positions, DiSEqC port, unicable) and exit without touching the tuner |
+| `--lnb-lo/hi/sw kHz` | universal LNB parameters (defaults 9750/10600/11700 MHz) |
+| `--secs S` | LOCK wait per tuner (default 8) |
+| `--scan-secs S` | base scan time (default 25; extends while data still arrives, stops after 15 s idle) |
+
+## Output format
+
+One line per record on stdout, diagnostics on stderr:
+
+```
+# provider=Polsat Box freq=12188000 pol=V lock=1 frontend=0
+T 1CE8:0071 freq=12188000 pol=V sr=27500000 fec=3 sys=S2 pos=130E mod=2
+S 3391:3390:0071 type=1 ca=1 "Polsat HD" "Cyfrowy Polsat S.A."
+L 1 3391:3390:0071 visible=1 src=nit
+```
+
+- `T` — transponder from NIT (`tsid:onid`, frequency kHz, polarisation, symbol
+  rate, DVB FEC code, S/S2, orbital position, modulation),
+- `S` — service from SDT (`sid:tsid:onid`, DVB service type, `ca` free/scrambled
+  flag, name, provider),
+- `L` — logical channel number (`src=nit` — Polsat, descriptor 0x82;
+  `src=bat` — Canal+, descriptor 0x83 in bouquet 0x2020, with the
+  visible-service flag).
+
+## How it reads the data
+
+Tunes to the platform's home transponder (Canal+: 10719 V, Polsat: 12188 V)
+and reads DVB SI tables from the demux with three parallel section filters:
+SDT actual+other in one mask (0x42/0xFB), NIT actual, and BAT filtered by
+bouquet id. The BAT filter is additionally verified in software — some demux
+drivers (seen on some boxes) ignore the extension part of the hardware filter.
+
+## Credits / inspiration
+
+satscan was inspired by **[SatScanLcn](https://github.com/Huevos/SatScanLcn)**
+by Huevos — an Enigma2 plugin covering 30+ European platforms. Its provider
+database and descriptor parsing were the reference for the home-transponder
+parameters and the LCN descriptor layouts (0x82 NIT / 0x83 BAT) used here.
+satscan is an independent from-scratch implementation (Zig, raw syscalls,
+no Enigma2 dependency), not a port of its code.
+
+## Source layout
+
+| file | role |
+|---|---|
+| `src/dvb.zig` | Linux DVB API: tuning (DiSEqC committed/uncommitted, Unicable, LNB), demux section filters, section pump, raw-syscall I/O, buffered stdout |
+| `src/si.zig` | DVB SI parsers: SDT, NIT/BAT with the per-platform LCN layouts, satellites.xml |
+| `src/settings.zig` | `/etc/enigma2/settings` → per-NIM dish model (positions, ports, SCR) |
+| `src/providers.zig` | the platform table |
+| `src/main.zig` | CLI, tuner selection, the two scan modes |
+
+Every length field read from the air is bounds-checked: the build is ReleaseSmall
+(no runtime safety), so a malformed section must never become a silent
+out-of-range read.
+
+## Building
+
+```sh
+zig build      # produces zig-out/bin/satscan-armhf and satscan-mipsel
+```
+
+Two portable flavours, chosen the hard way:
+
+- **satscan-armhf** — ARMv7 + VFPv3-D16, **NEON explicitly disabled**: some
+  STB SoCs (some ARM STBs) lack NEON and the default baseline SIGILLs; the
+  no-NEON build runs on every ARM box we tried, NEON-capable ones included.
+- **satscan-mipsel** — MIPS32 **r1**: older Broadcom MIPS (e.g. BCM7362) SIGILL on r2 instructions. Also note MIPS encodes `ioctl`
+  numbers differently — the code uses arch-aware `std.os.linux.IOCTL`.
+
+CI builds both flavours on every push and publishes GitHub Releases with
+checksums on `satscan-v*` tags.
+
+## License
+
+GPL-2.0 — see [LICENSE](LICENSE). The provider parameters and descriptor
+layouts were derived from [SatScanLcn](https://github.com/Huevos/SatScanLcn)
+(GPLv2), so this project keeps the same licence.
+
+## Tested on
+
+| box | arch | dish setup |
+|---|---|---|
+| 2×DVB-S2X box | armv7l | universal LNB, no DiSEqC |
+| FBC box (8×) | armv7l | Unicable EN50494 (Sharp, auto-configured from settings) |
+| ARM box (no NEON) | armv7l | universal LNB |
+| MIPS box | mipsel r1 | universal LNB |
+| FBC box (8×) | armv7l | A/B DiSEqC switch: 13.0E + 19.2E |
+
+Full captures from the 13E boxes are **bit-identical** (Canal+: 38 T / 644 S /
+629 L; Polsat: 42 T / 335 S / 297 L). The 19.2E platforms were captured on the
+A/B-switch box, likewise identical across consecutive runs.
