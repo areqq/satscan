@@ -2,7 +2,7 @@
 
 Samodzielna binarka bez zależności, która skanuje ramówki platform z Hot Birda
 13.0E wprost z tunera DVB-S/S2 i wypisuje je jako zwykły tekst — nazwy usług,
-transpondery i numerację operatora (LCN). Napisana od zera w **Zig 0.16**,
+transpondery i numerację operatora (LCN). Napisana od zera w **Zig 0.17**,
 wyłącznie surowe syscalle Linuksa (bez libc, statyczne binarki musl ~150–230 KB).
 
 Obsługiwani providerzy (`--provider`):
@@ -65,7 +65,22 @@ Zwykle to wszystko — narzędzie konfiguruje się samo:
   uncommitted i mini-DiSEqC tone burst (A/B), który wysyła też enigma — dla
   przełączników reagujących wyłącznie na burst,
 - próbuje kolejnych frontendów, aż któryś się otworzy (zajęte tunery zwracają
-  `EBUSY` i są pomijane) **i** złapie LOCK,
+  `EBUSY` i są pomijane) i złapie **LOCK**; pomija też frontendy otwarte przez
+  inny proces (oprogramowanie dekodera grające telewizję) oraz wszystkie
+  skonfigurowane na to samo pasmo użytkownika Unicable, więc skan nie zabiera
+  obrazu,
+- na **tunerach FBC** (jeden kabel, wiele demodulatorów) komendy
+  DiSEqC/Unicable wysyła tylko frontend-korzeń, więc linkowany frontend
+  wysyła je przez korzeń, gdy ten jest wolny. Gdy korzeń trzyma oprogramowanie
+  dekodera (telewizja na żywo), satscan **skanuje przez dekoder**: żądanie
+  strumienia na porcie strumieniowania (`--stream-port`, domyślnie 8001) każe
+  mu zestroić wolny frontend na żądany transponder, satscan rozpoznaje ten
+  frontend po TSID w PAT i czyta z niego tablice SI — obraz zostaje nietknięty.
+  Żądanie wymaga usługi z tego transpondera z `lamedb` dekodera (`--lamedb`),
+  więc pełny skan satelity w tym trybie obejmuje transpondery znane dekoderowi.
+  `--via-receiver` wymusza ten tryb,
+- domyślnie czyta SI z **demuxa o najwyższym numerze**, najrzadziej używanego
+  (`--demux` przypina inny),
 - skanuje aż tablica bukietu będzie **kompletna** (śledzenie sekcji BAT): po
   nominalnym oknie `--scan-secs` czyta dalej, dopóki napływają nowe usługi, LCN-y
   lub sekcje, i kończy po 15 s ciszy — dzięki temu wolne, wielkie tablice (BAT
@@ -78,6 +93,7 @@ Opcje:
 | `--provider <klucz>` | którą platformę skanować (wymagane, chyba że `--scan-all`; klucze w tabelach wyżej, `--help` je wypisuje) |
 | `--adapter N` / `--frontend N` / `--demux N` | przypięcie konkretnych urządzeń (domyślnie: auto) |
 | `--settings ŚCIEŻKA` | ustawienia enigmy (domyślnie `/etc/enigma2/settings`) |
+| `--via-receiver` / `--stream-port N` / `--lamedb ŚCIEŻKA` | skan przez działający dekoder (wyżej); automatycznie, gdy korzeń FBC trzyma inny proces |
 | `--scr-slot N --scr-freq MHz` | wymuszenie Unicable EN50494 (nadpisuje settings) |
 | `--diseqc-port N` | wymuszenie portu committed DiSEqC 0–3 (nadpisuje settings) |
 | `--dry-run` | wypisuje decyzję o antenie/tunerze (pozycje, port DiSEqC, unicable) i kończy, nie dotykając tunera |

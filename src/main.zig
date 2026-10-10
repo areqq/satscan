@@ -22,6 +22,7 @@ const linux = std.os.linux;
 const dvb = @import("dvb.zig");
 const si = @import("si.zig");
 const settings = @import("settings.zig");
+const receiver = @import("receiver.zig");
 const providers = @import("providers.zig");
 
 const Provider = providers.Provider;
@@ -38,8 +39,13 @@ const USAGE =
     \\Tuner selection (default: automatic from /etc/enigma2/settings):
     \\  --adapter N          DVB adapter (default 0)
     \\  --frontend N         pin a frontend instead of trying each in turn
-    \\  --demux N            demux device (default 0)
+    \\                       (auto skips frontends open in another process)
+    \\  --demux N            demux device (default: the highest one present)
     \\  --settings PATH      enigma settings file (default /etc/enigma2/settings)
+    \\  --via-receiver       let the running receiver tune (stream request on
+    \\                       --stream-port, default 8001; services from --lamedb,
+    \\                       default /etc/enigma2/lamedb). Automatic on an FBC
+    \\                       tuner whose root frontend another process holds.
     \\  --diseqc-port N      force committed DiSEqC port 0-3
     \\  --scr-slot N --scr-freq MHz   force Unicable EN50494 user band
     \\  --lnb-lo/--lnb-hi/--lnb-sw kHz  LNB local oscillators / band switch
@@ -65,7 +71,7 @@ fn usage() void {
 const Cli = struct {
     adapter: u32 = 0,
     fe_index: ?u32 = null, // null = auto-select a working tuner
-    demux: u32 = 0,
+    demux: ?u32 = null, // null = highest existing demux device
     provider_key: ?[]const u8 = null,
     lnb: dvb.Lnb = .{},
     secs: u32 = 8,
@@ -73,6 +79,9 @@ const Cli = struct {
     scr_slot: ?u8 = null,
     scr_freq: u32 = 0,
     settings_path: [:0]const u8 = "/etc/enigma2/settings",
+    lamedb_path: [:0]const u8 = receiver.DEFAULT_LAMEDB,
+    stream_port: u16 = receiver.DEFAULT_PORT,
+    via_receiver: bool = false,
     cli_port: ?u8 = null,
     dry_run: bool = false,
     scan_all: bool = false,
@@ -126,6 +135,12 @@ fn parseCli(init: std.process.Init.Minimal) !Cli {
             c.secs = try argInt(u32, &it, a);
         } else if (std.mem.eql(u8, a, "--scan-secs")) {
             c.scan_secs = try argInt(u32, &it, a);
+        } else if (std.mem.eql(u8, a, "--lamedb")) {
+            c.lamedb_path = try argStr(&it, a);
+        } else if (std.mem.eql(u8, a, "--stream-port")) {
+            c.stream_port = try argInt(u16, &it, a);
+        } else if (std.mem.eql(u8, a, "--via-receiver")) {
+            c.via_receiver = true;
         } else if (std.mem.eql(u8, a, "--scr-slot")) {
             c.scr_slot = try argInt(u8, &it, a);
         } else if (std.mem.eql(u8, a, "--scr-freq")) {
@@ -174,24 +189,89 @@ fn parseCli(init: std.process.Init.Minimal) !Cli {
 // ---------- tuner selection ----------
 
 const Tuner = struct {
-    fd: i32,
+    fd: i32, // -1 when the receiver tunes for us
+    sec_fd: i32, // where SEC commands go: fd itself, or the FBC root frontend
     index: u32,
     sw: dvb.Switch,
     tp: dvb.Tp, // the transponder that actually locked
+    stream: ?receiver.Stream = null, // scan through the receiver (see receiver.zig)
+
+    fn drainFd(self: Tuner) i32 {
+        return if (self.stream) |st| st.sock else -1;
+    }
+
+    fn closeAll(self: Tuner) void {
+        if (self.stream) |st| st.close();
+        if (self.sec_fd >= 0 and self.sec_fd != self.fd) dvb.close(self.sec_fd);
+        if (self.fd >= 0) dvb.close(self.fd);
+    }
 };
 
 const SelectError = error{ NoLock, PositionNotConfigured, TunerBusy, OutOfMemory, Overflow };
 
+/// Scan through the receiver: it tunes one of `cands` for us (see receiver.zig).
+fn selectViaReceiver(cli: Cli, cands: []const dvb.Tp, dmx_path: [*:0]const u8, alloc: std.mem.Allocator) ?Tuner {
+    const db = receiver.load(alloc, cli.lamedb_path) orelse {
+        std.debug.print("[satscan] via receiver: cannot read {s}\n", .{cli.lamedb_path});
+        return null;
+    };
+    defer db.deinit(alloc);
+    for (cands) |tp| {
+        const pol: u8 = if (tp.pol_h) 'H' else 'V';
+        const st = receiver.open(db, tp, cli.stream_port, cli.adapter, dmx_path, cli.secs + 4) catch |err| {
+            std.debug.print("[satscan] via receiver: {d}{c}: {s}\n", .{ tp.freq, pol, switch (err) {
+                error.NoService => "no service of this transponder in lamedb",
+                error.Connect => "stream port not answering",
+                error.NotTuned => "receiver did not bring the transponder up",
+            } });
+            continue;
+        };
+        std.debug.print("[satscan] via receiver: {d}{c} up on frontend{d} (TSID {X:0>4})\n", .{ tp.freq, pol, st.frontend, st.tsid });
+        return .{ .fd = -1, .sec_fd = -1, .index = st.frontend, .sw = .{}, .tp = tp, .stream = st };
+    }
+    return null;
+}
+
 /// Walk the frontends (or the pinned one), pick the first that opens, reaches
 /// `target_pos` per settings and locks on a real stream for one of `cands`.
-fn selectTuner(cli: Cli, nims: []const settings.NimCfg, have_settings: bool, target_pos: u32, cands: []const dvb.Tp, dmx_path: [*:0]const u8) SelectError!Tuner {
+fn selectTuner(cli: Cli, nims: []const settings.NimCfg, have_settings: bool, target_pos: u32, cands: []const dvb.Tp, dmx_path: [*:0]const u8, alloc: std.mem.Allocator) SelectError!Tuner {
+    if (cli.via_receiver) return selectViaReceiver(cli, cands, dmx_path, alloc) orelse error.NoLock;
     const cli_scr: ?dvb.Scr = if (cli.scr_slot) |sl| .{ .slot = sl, .freq_mhz = cli.scr_freq } else null;
     var pathbuf: [64]u8 = undefined;
     var tuners_tried: usize = 0; // frontends we actually tuned
     var unreachable_nims: usize = 0; // skipped: dish config cannot reach target_pos
+    // Frontends held open by another process belong to it (the receiver
+    // software showing live TV): tuning them would steal the picture, and on
+    // Unicable retuning their user band kills it just the same from any
+    // frontend. A busy frontend cannot be opened read-write, but a linked FBC
+    // frontend on the same user band could still be.
+    var in_use: [settings.MAX_NIMS]bool = @splat(false);
+    var busy_slots: u8 = 0;
+    {
+        var i: u32 = 0;
+        while (i < settings.MAX_NIMS) : (i += 1) {
+            const path = std.mem.printSentinel(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ cli.adapter, i }, 0) catch break;
+            if (linux.access(path, 0) != 0) break;
+            if (!dvb.openElsewhere(path)) continue;
+            in_use[i] = true;
+            if (have_settings) {
+                if (settings.effectiveNim(nims, i, target_pos)) |cfg| {
+                    if (cfg.usesUnicable()) busy_slots |= @as(u8, 1) << @intCast(cfg.scr_slot & 7);
+                }
+            }
+        }
+    }
+    var root_held = false; // an FBC root in another process: only the receiver can steer the dish
     var f: u32 = cli.fe_index orelse 0;
     const f_end: u32 = if (cli.fe_index) |fi| fi + 1 else settings.MAX_NIMS;
     while (f < f_end) : (f += 1) {
+        if (in_use[f]) {
+            if (cli.fe_index == null) {
+                std.debug.print("[satscan] frontend{d}: open in another process - skipping\n", .{f});
+                continue;
+            }
+            std.debug.print("[satscan] frontend{d}: open in another process - pinned, tuning anyway\n", .{f});
+        }
         var sw = dvb.Switch{ .scr = cli_scr, .committed = cli.cli_port };
         if (have_settings) {
             if (settings.effectiveNim(nims, f, target_pos)) |cfg| {
@@ -203,7 +283,7 @@ fn selectTuner(cli: Cli, nims: []const settings.NimCfg, have_settings: bool, tar
                 std.debug.print("[satscan] frontend{d}: NIM not configured for {d}.{d}E - trying anyway\n", .{ f, target_pos / 10, target_pos % 10 });
             }
         }
-        const fe_path = std.fmt.bufPrintZ(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ cli.adapter, f }) catch return error.Overflow;
+        const fe_path = std.mem.printSentinel(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ cli.adapter, f }, 0) catch return error.Overflow;
         const fd = dvb.sysOpen(fe_path, true) orelse {
             if (cli.fe_index != null) {
                 std.debug.print("[satscan] frontend{d} busy/unavailable\n", .{f});
@@ -212,7 +292,15 @@ fn selectTuner(cli: Cli, nims: []const settings.NimCfg, have_settings: bool, tar
             continue;
         };
         if (sw.scr) |u| {
-            std.debug.print("[satscan] frontend{d}: unicable slot={d} freq={d}MHz{s}\n", .{ f, u.slot, u.freq_mhz, if (sw.committed != null) " (+bank)" else "" });
+            if (busy_slots & (@as(u8, 1) << @intCast(u.slot & 7)) != 0) {
+                if (cli.fe_index == null) {
+                    std.debug.print("[satscan] frontend{d}: Unicable user band {d} belongs to a frontend in use - skipping\n", .{ f, u.slot });
+                    dvb.close(fd);
+                    continue;
+                }
+                std.debug.print("[satscan] frontend{d}: Unicable user band {d} belongs to a frontend in use - pinned, tuning anyway\n", .{ f, u.slot });
+            }
+            std.debug.print("[satscan] frontend{d}: Unicable user band {d} at {d}MHz{s}\n", .{ f, u.slot, u.freq_mhz, if (sw.committed != null) " (+bank)" else "" });
         } else if (sw.committed) |pt| {
             std.debug.print("[satscan] frontend{d}: plain LNB, DiSEqC committed port {d}{s}\n", .{ f, pt, if (sw.uncommitted != null) " + uncommitted" else "" });
         } else {
@@ -222,18 +310,39 @@ fn selectTuner(cli: Cli, nims: []const settings.NimCfg, have_settings: bool, tar
         // real stream. Taking "the first one that opens" bit us on multi-tuner
         // boxes where frontend0 has no cable - every transponder then reports
         // lock=0 while the working tuner sits idle.
+        // A linked FBC frontend shares the cable of its root frontend and has
+        // no SEC output of its own: DiSEqC/Unicable commands sent through the
+        // link are accepted and dropped (the LNB keeps whatever its user band
+        // was last told, which once looked like a working lock). So send SEC
+        // through the root - and when another process holds the root, there is
+        // no way to steer the dish from here: leave it to the receiver.
+        var sec_fd = fd;
+        if (dvb.fbcRoot(f)) |root| {
+            const root_path = std.mem.printSentinel(&pathbuf, "/dev/dvb/adapter{d}/frontend{d}", .{ cli.adapter, root }, 0) catch return error.Overflow;
+            if (dvb.sysOpen(root_path, true)) |rfd| {
+                sec_fd = rfd;
+                std.debug.print("[satscan] frontend{d}: FBC link - SEC via root frontend{d}\n", .{ f, root });
+            } else if (cli.fe_index == null) {
+                std.debug.print("[satscan] frontend{d}: FBC link, root frontend{d} held by another process - cannot steer the dish, skipping\n", .{ f, root });
+                root_held = true;
+                dvb.close(fd);
+                continue;
+            } else {
+                std.debug.print("[satscan] frontend{d}: FBC link, root frontend{d} held by another process - pinned, SEC via the link will likely be lost\n", .{ f, root });
+            }
+        }
         tuners_tried += 1;
         for (cands) |tp| {
             // Report every attempt: a quiet fall-through to a spare transponder
             // once hid a wrong code rate on the home mux for weeks.
             const pol: u8 = if (tp.pol_h) 'H' else 'V';
-            dvb.tune(fd, tp, cli.lnb, sw) catch {
+            dvb.tune(fd, sec_fd, tp, cli.lnb, sw) catch {
                 std.debug.print("[satscan] frontend{d}: {d}{c} fec={s}: tune failed\n", .{ f, tp.freq, pol, dvb.fecName(tp.fec) });
                 continue;
             };
             var ok = dvb.waitLock(fd, cli.secs);
             if (!ok and sw.scr != null) { // unicable can be moody - one retry
-                dvb.tune(fd, tp, cli.lnb, sw) catch {};
+                dvb.tune(fd, sec_fd, tp, cli.lnb, sw) catch {};
                 ok = dvb.waitLock(fd, cli.secs);
             }
             std.debug.print("[satscan] frontend{d}: {d}{c} fec={s}: {s}\n", .{ f, tp.freq, pol, dvb.fecName(tp.fec), if (ok) "LOCK" else "no LOCK" });
@@ -243,10 +352,15 @@ fn selectTuner(cli: Cli, nims: []const settings.NimCfg, have_settings: bool, tar
                 std.debug.print("[satscan] frontend{d}: LOCK but no stream (no PAT) - ignoring\n", .{f});
                 continue;
             }
-            return .{ .fd = fd, .index = f, .sw = sw, .tp = tp };
+            return .{ .fd = fd, .sec_fd = sec_fd, .index = f, .sw = sw, .tp = tp };
         }
         std.debug.print("[satscan] frontend{d}: no LOCK\n", .{f});
+        if (sec_fd != fd) dvb.close(sec_fd);
         dvb.close(fd);
+    }
+    if (root_held) {
+        std.debug.print("[satscan] FBC root held by another process - scanning through the receiver\n", .{});
+        if (selectViaReceiver(cli, cands, dmx_path, alloc)) |t| return t;
     }
     // "did not lock" and "no tuner can even reach this position" are different
     // faults: the first means no signal, the second a dish/DiSEqC config that
@@ -332,7 +446,12 @@ const ScanAllCtx = struct {
 /// Walk every transponder from the queue (seeded from satellites.xml, extended
 /// live with NIT discoveries), grab SDT actual + NIT on each, emit T/S lines.
 /// LCN is provider-specific, so none here.
-fn scanAll(t: Tuner, cli: Cli, dmx_path: [*:0]const u8, queue: *si.TpQueue, pos_label: u32, out: *dvb.Out, alloc: std.mem.Allocator) !void {
+fn scanAll(t: *Tuner, cli: Cli, dmx_path: [*:0]const u8, queue: *si.TpQueue, pos_label: u32, out: *dvb.Out, alloc: std.mem.Allocator) !void {
+    // Through the receiver every transponder is its own stream request; the
+    // one from tuner selection is just the first to be replaced.
+    const via = t.stream != null;
+    const db: ?receiver.Lamedb = if (via) receiver.load(alloc, cli.lamedb_path) orelse return error.LamedbUnreadable else null;
+    defer if (db) |d| d.deinit(alloc);
     var seen = si.SeenSvc.init(alloc);
     defer seen.deinit();
     var seen_tp = si.Seen.init(alloc);
@@ -347,16 +466,27 @@ fn scanAll(t: Tuner, cli: Cli, dmx_path: [*:0]const u8, queue: *si.TpQueue, pos_
         if (cli.max_tp != 0 and tried >= cli.max_tp) break;
         tried += 1;
         const q = queue.items[i];
-        dvb.tune(t.fd, q.tp, cli.lnb, t.sw) catch {
-            out.line("# tp {d}{c} sr={d} lock=err\n", .{ q.tp.freq, si.POLCHARS[q.pol], q.tp.sr });
-            continue;
-        };
-        // Same PAT guard as the provider path: on an FBC input without signal
-        // every frequency "locks", and a full scan would report 100% locks with
-        // zero services.
-        if (!dvb.waitLock(t.fd, cli.secs) or !dvb.streamAlive(dmx_path, t.index, 2000)) {
-            out.line("# tp {d}{c} sr={d} lock=0\n", .{ q.tp.freq, si.POLCHARS[q.pol], q.tp.sr });
-            continue;
+        if (via) {
+            if (t.stream) |st| st.close();
+            t.stream = null;
+            const st = receiver.open(db.?, q.tp, cli.stream_port, cli.adapter, dmx_path, cli.secs + 4) catch |err| {
+                out.line("# tp {d}{c} sr={d} lock={s}\n", .{ q.tp.freq, si.POLCHARS[q.pol], q.tp.sr, if (err == error.NoService) "skip" else "0" });
+                continue;
+            };
+            t.stream = st;
+            t.index = st.frontend;
+        } else {
+            dvb.tune(t.fd, t.sec_fd, q.tp, cli.lnb, t.sw) catch {
+                out.line("# tp {d}{c} sr={d} lock=err\n", .{ q.tp.freq, si.POLCHARS[q.pol], q.tp.sr });
+                continue;
+            };
+            // Same PAT guard as the provider path: on an FBC input without signal
+            // every frequency "locks", and a full scan would report 100% locks with
+            // zero services.
+            if (!dvb.waitLock(t.fd, cli.secs) or !dvb.streamAlive(dmx_path, t.index, 2000)) {
+                out.line("# tp {d}{c} sr={d} lock=0\n", .{ q.tp.freq, si.POLCHARS[q.pol], q.tp.sr });
+                continue;
+            }
         }
         locked += 1;
         out.line("# tp {d}{c} sr={d} lock=1\n", .{ q.tp.freq, si.POLCHARS[q.pol], q.tp.sr });
@@ -373,7 +503,7 @@ fn scanAll(t: Tuner, cli: Cli, dmx_path: [*:0]const u8, queue: *si.TpQueue, pos_
             .{ .fd = fd_nit, .events = linux.POLL.IN, .revents = 0 },
         };
         var ctx = ScanAllCtx{ .out = out, .seen = &seen, .seen_tp = &seen_tp, .seen_lcn = &seen_lcn, .queue = queue, .fd_sdt = fd_sdt, .tp = q, .pos_label = pos_label };
-        _ = dvb.pumpSections(&fds, dvb.nowMs() + @as(i64, cli.tp_secs) * 1000, &ctx, ScanAllCtx.onSection);
+        _ = dvb.pumpSections(&fds, dvb.nowMs() + @as(i64, cli.tp_secs) * 1000, t.drainFd(), &ctx, ScanAllCtx.onSection);
         dvb.demuxStop(fd_sdt);
         dvb.demuxStop(fd_nit);
     }
@@ -385,7 +515,7 @@ fn scanAll(t: Tuner, cli: Cli, dmx_path: [*:0]const u8, queue: *si.TpQueue, pos_
 const BatTracker = struct {
     version: i32 = -1,
     last: i32 = -1,
-    got: [256]bool = [_]bool{false} ** 256,
+    got: [256]bool = @splat(false),
     count: usize = 0,
 
     fn note(self: *BatTracker, sec: []const u8) void {
@@ -393,7 +523,7 @@ const BatTracker = struct {
         if (ver != self.version) { // list update mid-scan: start over
             self.version = ver;
             self.last = sec[7];
-            self.got = [_]bool{false} ** 256;
+            self.got = @splat(false);
             self.count = 0;
         }
         if (!self.got[sec[6]]) {
@@ -500,7 +630,7 @@ fn scanProvider(t: Tuner, p: Provider, cli: Cli, dmx_path: [*:0]const u8, out: *
             if (bat_done or now - last_progress >= stall_ms or now - t0 >= abs_cap_ms) break;
         }
         // pump in 1 s slices so the progress/stall logic above gets to run
-        if (!dvb.pumpSections(fds_buf[0..nfds], now + 1000, &ctx, ProviderCtx.onSection)) break;
+        if (!dvb.pumpSections(fds_buf[0..nfds], now + 1000, t.drainFd(), &ctx, ProviderCtx.onSection)) break;
     }
 
     dvb.demuxStop(fd_sdt);
@@ -566,7 +696,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const target_pos: u32 = p.pos;
 
     // Tuner configuration from enigma settings (unicable, dish/DiSEqC layout).
-    var nims = [_]settings.NimCfg{.{}} ** settings.MAX_NIMS;
+    var nims: [settings.MAX_NIMS]settings.NimCfg = @splat(.{});
     const have_settings = settings.parse(alloc, cli.settings_path, &nims);
     if (!have_settings) std.debug.print("[satscan] no {s} - trying every tuner with a plain LNB\n", .{cli.settings_path});
 
@@ -576,15 +706,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     var dmxbuf: [64]u8 = undefined;
-    const dmx_path = try std.fmt.bufPrintZ(&dmxbuf, "/dev/dvb/adapter{d}/demux{d}", .{ cli.adapter, cli.demux });
+    const demux = cli.demux orelse dvb.highestDemux(cli.adapter);
+    const dmx_path = try std.mem.printSentinel(&dmxbuf, "/dev/dvb/adapter{d}/demux{d}", .{ cli.adapter, demux }, 0);
 
-    const t = try selectTuner(cli, &nims, have_settings, target_pos, cands, dmx_path);
-    defer dvb.close(t.fd);
+    var t = try selectTuner(cli, &nims, have_settings, target_pos, cands, dmx_path, alloc);
+    defer t.closeAll();
     std.debug.print("[satscan] tuner: frontend{d}\n", .{t.index});
 
     if (cli.scan_all) {
         out.line("# scan-all pos={d} tps={d} frontend={d}\n", .{ cli.sat_pos, queue.len, t.index });
-        try scanAll(t, cli, dmx_path, &queue, cli.sat_pos, &out, alloc);
+        try scanAll(&t, cli, dmx_path, &queue, cli.sat_pos, &out, alloc);
     } else {
         try scanProvider(t, p, cli, dmx_path, &out, alloc);
     }

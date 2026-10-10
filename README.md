@@ -3,7 +3,7 @@
 Standalone, dependency-free binary that scans channel line-ups of the Hot Bird
 13.0E platforms straight off a DVB-S/S2 tuner and prints them as plain text —
 service names, transponders and the operator's logical channel numbers (LCN).
-Written from scratch in **Zig 0.16**, raw Linux syscalls only (no libc, static
+Written from scratch in **Zig 0.17**, raw Linux syscalls only (no libc, static
 musl binaries ~150–230 KB).
 
 Supported providers (`--provider`):
@@ -64,7 +64,22 @@ That is usually all — the tool configures itself:
   followed by the uncommitted one and the mini-DiSEqC tone burst (A/B) that
   enigma also sends, for switches that only react to the burst,
 - tries successive frontends until one both opens (busy tuners return
-  `EBUSY` and are skipped) and achieves **LOCK**,
+  `EBUSY` and are skipped) and achieves **LOCK**; frontends held open by
+  another process (the receiver software showing live TV) are skipped too,
+  along with every frontend configured for the same Unicable user band, so a
+  scan never steals the picture,
+- on **FBC tuners** (one cable, many demodulators) only the root frontend can
+  send DiSEqC/Unicable commands, so a linked frontend sends them through the
+  root when that one is free. When the receiver software holds the root for
+  live TV, satscan **scans through the receiver** instead: a stream request on
+  its streaming port (`--stream-port`, default 8001) makes it tune a free
+  frontend to the wanted transponder, satscan finds that frontend by the TSID
+  in its PAT and reads the SI tables off it — live TV is untouched. The
+  request needs a service of that transponder from the receiver's `lamedb`
+  (`--lamedb`), so a full-satellite scan this way covers the transponders the
+  receiver knows. `--via-receiver` forces the mode,
+- reads SI from the **highest demux device** by default, the one least likely
+  to be in use (`--demux` pins another),
 - keeps scanning until the bouquet table is **complete** (BAT section tracking),
   not just for a fixed time: past the nominal window it reads on while new
   services, LCNs or sections keep arriving and stops after 15 s of silence, so
@@ -77,6 +92,7 @@ Options:
 | `--provider <key>` | which platform to scan (required unless `--scan-all`; keys in the tables above, `--help` lists them) |
 | `--adapter N` / `--frontend N` / `--demux N` | pin specific devices (default: auto) |
 | `--settings PATH` | enigma settings path (default `/etc/enigma2/settings`) |
+| `--via-receiver` / `--stream-port N` / `--lamedb PATH` | scan through the running receiver (see above); automatic when an FBC root frontend is held by another process |
 | `--scr-slot N --scr-freq MHz` | force Unicable EN50494 (overrides settings) |
 | `--diseqc-port N` | force committed DiSEqC port 0–3 (overrides settings) |
 | `--dry-run` | print the dish/tuner decision (positions, DiSEqC port, unicable) and exit without touching the tuner |

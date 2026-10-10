@@ -67,7 +67,7 @@ const dtv_property = extern struct {
     cmd: u32,
     reserved: [3]u32 = .{ 0, 0, 0 },
     data: u32 = 0,
-    pad: [48]u8 = [_]u8{0} ** 48, // rest of union u (on 32-bit: 52 bytes incl. data)
+    pad: [48]u8 = @splat(0), // rest of union u (on 32-bit: 52 bytes incl. data)
     result: i32 = 0,
 };
 
@@ -86,9 +86,9 @@ const FE_SET_TONE = IOCTL.IO('o', 66);
 
 // ---------- demux ----------
 const dmx_filter = extern struct {
-    filter: [16]u8 = [_]u8{0} ** 16,
-    mask: [16]u8 = [_]u8{0} ** 16,
-    mode: [16]u8 = [_]u8{0} ** 16,
+    filter: [16]u8 = @splat(0),
+    mask: [16]u8 = @splat(0),
+    mode: [16]u8 = @splat(0),
 };
 const dmx_sct_filter_params = extern struct {
     pid: u16,
@@ -217,7 +217,11 @@ fn diseqc(fd: i32, msg: [6]u8, len: u8, what: []const u8) !void {
     try ioctlChecked(fd, FE_DISEQC_SEND_MASTER_CMD, @intFromPtr(&cmd), what);
 }
 
-pub fn tune(fd: i32, tp: Tp, lnb: Lnb, sw: Switch) !void {
+/// Tune `fd` to `tp`. The SEC part (voltage, tone, DiSEqC/Unicable commands)
+/// goes to `sec_fd`: normally the same device, but on an FBC tuner a linked
+/// frontend has no SEC output of its own - the commands only reach the dish
+/// through the root frontend it is connected to (see `fbcRoot`).
+pub fn tune(fd: i32, sec_fd: i32, tp: Tp, lnb: Lnb, sw: Switch) !void {
     const high = tp.freq >= lnb.sw;
     var ifreq: u32 = if (high) tp.freq - lnb.hi else tp.freq - lnb.lo;
 
@@ -231,14 +235,14 @@ pub fn tune(fd: i32, tp: Tp, lnb: Lnb, sw: Switch) !void {
             0xE0,                                                                                                                                                           0x10,               0x5A,
             (@as(u8, u.slot & 0x07) << 5) | (bank << 4) | (@as(u8, @intFromBool(tp.pol_h)) << 3) | (@as(u8, @intFromBool(high)) << 2) | @as(u8, @intCast((t >> 8) & 0x03)), @intCast(t & 0xff), 0,
         };
-        try ioctlChecked(fd, FE_SET_TONE, SEC_TONE_OFF, "FE_SET_TONE");
-        try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_13, "FE_SET_VOLTAGE");
+        try ioctlChecked(sec_fd, FE_SET_TONE, SEC_TONE_OFF, "FE_SET_TONE");
+        try ioctlChecked(sec_fd, FE_SET_VOLTAGE, SEC_VOLTAGE_13, "FE_SET_VOLTAGE");
         sleepMs(15);
-        try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_18, "FE_SET_VOLTAGE(18)");
+        try ioctlChecked(sec_fd, FE_SET_VOLTAGE, SEC_VOLTAGE_18, "FE_SET_VOLTAGE(18)");
         sleepMs(10);
-        try diseqc(fd, msg, 5, "FE_DISEQC_SEND_MASTER_CMD(scr)");
+        try diseqc(sec_fd, msg, 5, "FE_DISEQC_SEND_MASTER_CMD(scr)");
         sleepMs(10);
-        try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_13, "FE_SET_VOLTAGE(13)");
+        try ioctlChecked(sec_fd, FE_SET_VOLTAGE, SEC_VOLTAGE_13, "FE_SET_VOLTAGE(13)");
         ifreq = u.freq_mhz * 1000; // receive on the user-band IF
     } else {
         const voltage: u32 = if (tp.pol_h) SEC_VOLTAGE_18 else SEC_VOLTAGE_13;
@@ -247,13 +251,13 @@ pub fn tune(fd: i32, tp: Tp, lnb: Lnb, sw: Switch) !void {
             // A committed and/or DiSEqC 1.1 uncommitted switch: tone off, 18V for
             // a reliable command, then send (order: committed, uncommitted, tone
             // burst - the "cut" order enigma uses for cascaded switches).
-            try ioctlChecked(fd, FE_SET_TONE, SEC_TONE_OFF, "FE_SET_TONE");
-            try ioctlChecked(fd, FE_SET_VOLTAGE, SEC_VOLTAGE_18, "FE_SET_VOLTAGE(18)");
+            try ioctlChecked(sec_fd, FE_SET_TONE, SEC_TONE_OFF, "FE_SET_TONE");
+            try ioctlChecked(sec_fd, FE_SET_VOLTAGE, SEC_VOLTAGE_18, "FE_SET_VOLTAGE(18)");
             sleepMs(15);
             if (sw.committed) |port| {
                 // committed (2/4-way, monoblocks): E0 10 38 <F0|port<<2|pol<<1|band>
                 const msg = [6]u8{ 0xE0, 0x10, 0x38, 0xF0 | (@as(u8, port & 0x03) << 2) | (@as(u8, @intFromBool(tp.pol_h)) << 1) | @as(u8, @intFromBool(high)), 0, 0 };
-                try diseqc(fd, msg, 4, "FE_DISEQC_SEND_MASTER_CMD");
+                try diseqc(sec_fd, msg, 4, "FE_DISEQC_SEND_MASTER_CMD");
                 sleepMs(54); // spec: >=15ms, switches like a bit more
             }
             if (sw.uncommitted) |up| {
@@ -261,20 +265,20 @@ pub fn tune(fd: i32, tp: Tp, lnb: Lnb, sw: Switch) !void {
                 // <F0|(port-1)>. Ports are numbered 1..16 in settings.
                 const idx: u8 = if (up > 0) up - 1 else 0;
                 const msg = [6]u8{ 0xE0, 0x10, 0x39, 0xF0 | (idx & 0x0F), 0, 0 };
-                try diseqc(fd, msg, 4, "FE_DISEQC_SEND_MASTER_CMD(uncommitted)");
+                try diseqc(sec_fd, msg, 4, "FE_DISEQC_SEND_MASTER_CMD(uncommitted)");
                 sleepMs(54);
             }
             // Many 2-way switches (and enigma's a/b mode) only react to the
             // mini-DiSEqC tone burst, so send it as well when a committed port is
             // in play: A for even ports, B for odd ones.
             if (sw.committed) |port| {
-                try ioctlChecked(fd, FE_DISEQC_SEND_BURST, @as(usize, port & 1), "FE_DISEQC_SEND_BURST");
+                try ioctlChecked(sec_fd, FE_DISEQC_SEND_BURST, @as(usize, port & 1), "FE_DISEQC_SEND_BURST");
                 sleepMs(30);
             }
         }
         // tone/voltage by band and polarisation (universal LNB)
-        try ioctlChecked(fd, FE_SET_VOLTAGE, voltage, "FE_SET_VOLTAGE");
-        try ioctlChecked(fd, FE_SET_TONE, tone, "FE_SET_TONE");
+        try ioctlChecked(sec_fd, FE_SET_VOLTAGE, voltage, "FE_SET_VOLTAGE");
+        try ioctlChecked(sec_fd, FE_SET_TONE, tone, "FE_SET_TONE");
     }
 
     var props = [_]dtv_property{
@@ -315,12 +319,112 @@ pub fn waitLock(fd: i32, secs: u32) bool {
 }
 
 // ---------- demux ----------
+var demux_source: ?u32 = null; // frontend the demux device was last routed to
+
 pub fn demuxOpenFor(dmx_path: [*:0]const u8, frontend: u32) ?i32 {
     const fd = sysOpen(dmx_path, true) orelse return null;
-    // Only reroute when we are not on the demux's default input (frontend0):
-    // some STB drivers disturb already-armed filters when re-sourced.
-    if (frontend > 0) _ = linux.ioctl(fd, DMX_SET_SOURCE, @intFromPtr(&frontend));
+    // Route the demux to our frontend once; re-sourcing an already-armed demux
+    // disturbs the filters on some STB drivers, so repeat only on a change.
+    if (demux_source != frontend) {
+        _ = linux.ioctl(fd, DMX_SET_SOURCE, @intFromPtr(&frontend));
+        demux_source = frontend;
+    }
     return fd;
+}
+
+/// Highest existing demux device of the adapter - the one least likely to be
+/// in use by the running receiver software (it takes demux0 for live TV and
+/// the next ones for recordings).
+pub fn highestDemux(adapter: u32) u32 {
+    var pathbuf: [64]u8 = undefined;
+    var best: u32 = 0;
+    var n: u32 = 0;
+    while (n < 32) : (n += 1) {
+        const path = std.mem.printSentinel(&pathbuf, "/dev/dvb/adapter{d}/demux{d}", .{ adapter, n }, 0) catch break;
+        if (linux.access(path, 0) != 0) break;
+        best = n;
+    }
+    return best;
+}
+
+/// Small text file (procfs) into a stack buffer, trimmed. Null when missing.
+fn readSmall(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, buf.ptr, buf.len);
+    if (linux.errno(n) != .SUCCESS) return null;
+    return std.mem.trim(u8, buf[0..n], " \r\n\t");
+}
+
+/// Calls `f(ctx, name)` for every entry of directory `path`; stops early when
+/// it returns true (and returns true itself).
+fn eachDirEntry(path: [*:0]const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), [:0]const u8) bool) bool {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [4096]u8 align(8) = undefined;
+    while (true) {
+        const n = linux.getdents64(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) return false;
+        var off: usize = 0;
+        while (off < n) {
+            const ent: *align(1) const linux.dirent64 = @ptrCast(&buf[off]);
+            const name_ptr: [*:0]const u8 = @ptrCast(&buf[off + @offsetOf(linux.dirent64, "name")]);
+            if (f(ctx, std.mem.span(name_ptr))) return true;
+            off += ent.reclen;
+        }
+    }
+}
+
+const OpenScan = struct {
+    dev_path: []const u8,
+    self_pid: i32,
+    pid: i32 = 0,
+
+    fn onPid(self: *OpenScan, name: [:0]const u8) bool {
+        const pid = std.fmt.parseInt(i32, name, 10) catch return false;
+        if (pid == self.self_pid) return false;
+        var pathbuf: [64]u8 = undefined;
+        const fd_dir = std.mem.printSentinel(&pathbuf, "/proc/{d}/fd", .{pid}, 0) catch return false;
+        self.pid = pid;
+        return eachDirEntry(fd_dir, self, onFd);
+    }
+
+    fn onFd(self: *OpenScan, name: [:0]const u8) bool {
+        var pathbuf: [80]u8 = undefined;
+        var linkbuf: [128]u8 = undefined;
+        const link = std.mem.printSentinel(&pathbuf, "/proc/{d}/fd/{s}", .{ self.pid, name }, 0) catch return false;
+        const n = linux.readlink(link, &linkbuf, linkbuf.len);
+        if (linux.errno(n) != .SUCCESS) return false;
+        return std.mem.eql(u8, linkbuf[0..n], self.dev_path);
+    }
+};
+
+/// True when another process holds `dev_path` open (scans /proc/<pid>/fd).
+/// A lock flag alone cannot tell: a demod keeps reporting LOCK long after the
+/// process that tuned it has gone.
+pub fn openElsewhere(dev_path: []const u8) bool {
+    var scan = OpenScan{ .dev_path = dev_path, .self_pid = linux.getpid() };
+    return eachDirEntry("/proc", &scan, OpenScan.onPid);
+}
+
+/// FBC tuners (Broadcom 4530x): frontends beyond the physical inputs are
+/// "linked" to a root frontend and share its cable. Their SEC ioctls are
+/// accepted but never reach the LNB. Returns the root frontend index when
+/// `frontend` is such a linked one.
+pub fn fbcRoot(frontend: u32) ?u32 {
+    var pathbuf: [64]u8 = undefined;
+    var buf: [16]u8 = undefined;
+    const link_path = std.mem.printSentinel(&pathbuf, "/proc/stb/frontend/{d}/fbc_link", .{frontend}, 0) catch return null;
+    const link = readSmall(link_path, &buf) orelse return null;
+    if (!std.mem.eql(u8, link, "1")) return null;
+    const conn_path = std.mem.printSentinel(&pathbuf, "/proc/stb/frontend/{d}/fbc_connect", .{frontend}, 0) catch return null;
+    const conn = readSmall(conn_path, &buf) orelse return null;
+    const root = std.fmt.parseInt(u32, conn, 10) catch return null;
+    return if (root == frontend) null else root;
 }
 
 pub fn setSectionFilter(fd: i32, pid: u16, table_id: u8, table_mask: u8, ext_id: ?u16) !void {
@@ -350,9 +454,13 @@ pub fn demuxStop(fd: i32) void {
 /// EAGAIN, but bounded: old drivers can return 0 on buffer overflow (busy-loop
 /// bait), and the caller's loop must keep checking its own clock. Returns false
 /// on a poll error.
-pub fn pumpSections(fds: []linux.pollfd, deadline_ms: i64, ctx: anytype, comptime on_sec: fn (@TypeOf(ctx), i32, []const u8) void) bool {
+/// Poll the section filters until `deadline_ms`, handing every section to
+/// `on_sec`. `drain_fd` (or -1) is read and discarded alongside - the stream
+/// socket of a scan through the receiver, which must keep flowing.
+pub fn pumpSections(fds: []linux.pollfd, deadline_ms: i64, drain_fd: i32, ctx: anytype, comptime on_sec: fn (@TypeOf(ctx), i32, []const u8) void) bool {
     var secbuf: [4200]u8 = undefined;
     while (nowMs() < deadline_ms) {
+        if (drain_fd >= 0) drain(drain_fd);
         const nr = linux.poll(fds.ptr, @intCast(fds.len), 300);
         if (linux.errno(nr) != .SUCCESS) return false;
         if (nr == 0) continue;
@@ -368,6 +476,70 @@ pub fn pumpSections(fds: []linux.pollfd, deadline_ms: i64, ctx: anytype, comptim
         }
     }
     return true;
+}
+
+/// Read and discard whatever is pending on a non-blocking fd.
+pub fn drain(fd: i32) void {
+    var buf: [16384]u8 = undefined;
+    var rounds: u32 = 0;
+    while (rounds < 64) : (rounds += 1) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) return;
+    }
+}
+
+/// Non-blocking TCP connection to 127.0.0.1:`port` (blocking connect, then
+/// non-blocking reads).
+pub fn tcpConnectLocal(port: u16) ?i32 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    const addr = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    _ = linux.fcntl(fd, linux.F.SETFL, flags | @as(usize, 1 << @bitOffsetOf(linux.O, "NONBLOCK")));
+    return fd;
+}
+
+pub fn writeAll(fd: i32, data: []const u8) bool {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = linux.write(fd, data.ptr + off, data.len - off);
+        if (linux.errno(n) != .SUCCESS) return false;
+        off += n;
+    }
+    return true;
+}
+
+/// Lock status of a frontend another process holds: a read-only open is
+/// always allowed and FE_READ_STATUS works on it.
+pub fn lockedReadOnly(path: [*:0]const u8) bool {
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    return hasLock(fd);
+}
+
+/// TSID from the PAT of the stream on `frontend` (null when none arrives).
+pub fn patTsid(dmx_path: [*:0]const u8, frontend: u32, ms: i64) ?u16 {
+    const dfd = demuxOpenFor(dmx_path, frontend) orelse return null;
+    defer close(dfd);
+    setSectionFilter(dfd, 0x00, 0x00, 0xff, null) catch return null;
+    var fds = [_]linux.pollfd{.{ .fd = dfd, .events = linux.POLL.IN, .revents = 0 }};
+    var secbuf: [4096]u8 = undefined;
+    const deadline = nowMs() + ms;
+    while (nowMs() < deadline) {
+        const nr = linux.poll(&fds, 1, 200);
+        if (linux.errno(nr) != .SUCCESS or nr == 0) continue;
+        if (fds[0].revents & linux.POLL.IN == 0) continue;
+        const n = linux.read(dfd, &secbuf, secbuf.len);
+        if (linux.errno(n) == .SUCCESS and n >= 8) return (@as(u16, secbuf[3]) << 8) | secbuf[4];
+    }
+    return null;
 }
 
 /// A demod can raise FE_HAS_LOCK with no transport stream behind it - seen on FBC

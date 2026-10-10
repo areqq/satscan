@@ -18,21 +18,21 @@ pub const NimCfg = struct {
     mode: NimMode = .unknown,
     single: bool = false, // diseqcMode=single -> never send a switch command
     ab_only: bool = false, // diseqcMode=toneburst_a_b / diseqc_a_b -> only ports 0 and 1 exist
-    positions: [MAX_SATS]u32 = [_]u32{0} ** MAX_SATS,
-    ports: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS,
-    has_port: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
+    positions: [MAX_SATS]u32 = @splat(0),
+    ports: [MAX_SATS]u8 = @splat(0),
+    has_port: [MAX_SATS]bool = @splat(false),
     /// From `advanced.sat.*` — these entries only count in advanced mode, see
     /// finalize(): images keep stale advanced blocks around while running simple.
-    from_advanced: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
+    from_advanced: [MAX_SATS]bool = @splat(false),
     // Uncommitted DiSEqC (1.1) port per position, and, for advanced mode, the LNB
     // block each position maps to. In advanced dishes the DiSEqC commands live in
     // the LNB block (advanced.lnb.<N>.*), not the sat block, so we buffer them and
     // resolve position -> lnb -> {committed, uncommitted} in finalize().
-    uports: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS,
-    has_uport: [MAX_SATS]bool = [_]bool{false} ** MAX_SATS,
-    lnb_of: [MAX_SATS]u8 = [_]u8{0} ** MAX_SATS, // 0 = unset
-    lnb_comm: [MAX_LNB]i16 = [_]i16{-1} ** MAX_LNB,
-    lnb_uncomm: [MAX_LNB]i16 = [_]i16{-1} ** MAX_LNB,
+    uports: [MAX_SATS]u8 = @splat(0),
+    has_uport: [MAX_SATS]bool = @splat(false),
+    lnb_of: [MAX_SATS]u8 = @splat(0), // 0 = unset
+    lnb_comm: [MAX_LNB]i16 = @splat(-1),
+    lnb_uncomm: [MAX_LNB]i16 = @splat(-1),
     nsat: usize = 0,
     dropped: bool = false, // MAX_SATS overflow happened
     unicable: bool = false, // from the advanced LNB block
